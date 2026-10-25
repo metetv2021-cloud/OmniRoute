@@ -4,9 +4,10 @@
 DeepSeek Web -> OpenAI-compatible API, as one standalone Python script.
 
 A port of OmniRoute's ``deepseek-web`` provider (open-sse/executors/deepseek-web.ts
-and the helpers it uses). You sign in to chat.deepseek.com once in a Chromium-based
-browser window (Chromium, Google Chrome, Microsoft Edge or Brave); the script then
-serves an OpenAI-compatible API backed by your DeepSeek web account:
+and the helpers it uses). `login` reuses the chat.deepseek.com login you already have
+in Google Chrome, Microsoft Edge, Brave or another Chromium-based browser, or opens a
+normal browser window for you to sign in; the script then serves an OpenAI-compatible
+API backed by your DeepSeek web account:
 
     POST /v1/chat/completions   streaming and non-streaming, reasoning
                                 ("reasoning_content"), web search with sources,
@@ -17,7 +18,7 @@ Requirements: Python 3.9+ and a Chromium-based browser. No pip packages.
 
 Windows quick start (cmd or PowerShell, in this folder):
 
-    py deepseek_web_api.py login     <- a browser window opens; sign in to DeepSeek
+    py deepseek_web_api.py login     <- reuses your browser's DeepSeek login, or opens a window
     py deepseek_web_api.py           <- serves http://127.0.0.1:20129/v1
 
 Point any OpenAI-compatible client at base_url http://127.0.0.1:20129/v1 with any
@@ -43,9 +44,9 @@ import shutil
 import socket
 import socketserver
 import string
-import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -70,8 +71,9 @@ CONTINUE_PATH = "/api/v0/chat/continue"
 UPLOAD_PATH = "/api/v0/file/upload_file"
 FETCH_FILES_PATH = "/api/v0/file/fetch_files"
 
-# What the chat.deepseek.com web client sent at the time of writing. `login` reads the
-# live client version from the web app and stores it, so these are only fallbacks.
+# What the chat.deepseek.com web client sent at the time of writing. A pasted "Copy as
+# cURL" (login --manual) stores the live values instead, and a login read from a browser
+# gets a user agent that matches that browser's version.
 DEFAULT_CLIENT_VERSION = "2.7.0"
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -616,7 +618,6 @@ def pow_response_header(challenge: Dict[str, Any], answer: int, target_path: str
 # ════════════════════════════════════════════════════════════════════════════
 
 _opener = urllib.request.build_opener()
-_direct_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def configure_proxy(url: Optional[str]) -> None:
@@ -689,8 +690,8 @@ def check_waf(status: int, headers: Any, what: str) -> None:
     if action or (status in (202, 403, 405) and "text/html" in ctype):
         detail = f"WAF action '{action}'" if action else f"HTTP {status}"
         raise WafError(
-            f"DeepSeek's firewall blocked the request to {what} ({detail}). Run the 'login' "
-            "command to refresh the browser cookies, or wait a few minutes and retry."
+            f"DeepSeek's firewall blocked the request to {what} ({detail}). Wait a few "
+            "minutes and retry; if you use a VPN or proxy, try without it."
         )
 
 
@@ -757,32 +758,6 @@ def client_hint_headers(creds: Dict[str, Any], user_agent: str) -> Dict[str, str
     if platform:
         headers["sec-ch-ua-platform"] = f'"{platform}"'
     return headers
-
-
-def cookie_header(cookies: Any) -> str:
-    """Cookie header for chat.deepseek.com from the cookies captured at login."""
-    if not isinstance(cookies, list):
-        return ""
-    now = time.time()
-    chosen: Dict[str, Tuple[int, str]] = {}
-    for cookie in cookies:
-        if not isinstance(cookie, dict):
-            continue
-        name, value = cookie.get("name"), cookie.get("value")
-        if not isinstance(name, str) or not name or not isinstance(value, str):
-            continue
-        if any(ch in name + value for ch in "\r\n;"):
-            continue
-        domain = str(cookie.get("domain") or "").lower().lstrip(".")
-        if domain and domain != "chat.deepseek.com" and not "chat.deepseek.com".endswith("." + domain):
-            continue
-        expires = cookie.get("expires")
-        if isinstance(expires, (int, float)) and 0 < expires < now:
-            continue
-        previous = chosen.get(name)
-        if previous is None or len(domain) > previous[0]:  # most specific domain wins
-            chosen[name] = (len(domain), value)
-    return "; ".join(f"{name}={value}" for name, (_, value) in chosen.items())
 
 
 def _walk_dicts(value: Any, depth: int = 0) -> Iterator[Dict[str, Any]]:
@@ -852,9 +827,6 @@ class DeepSeekClient:
         device_id = creds.get("device_id")
         if isinstance(device_id, str) and device_id:
             headers["x-device-id"] = device_id
-        cookie = cookie_header(creds.get("cookies"))
-        if cookie:
-            headers["Cookie"] = cookie
         if bearer:
             headers["Authorization"] = f"Bearer {bearer}"
         if content_type:
@@ -3293,26 +3265,26 @@ class App:
             )
 
     def with_auth_retry(self, fn: Callable[[], Any]) -> Any:
-        """On a rejected token or a firewall block, refresh from the browser profile once."""
+        """On a rejected token, look for a newer one in the browser profile it came from."""
         try:
             return fn()
-        except (AuthError, WafError) as exc:
-            if not self.auto_refresh or not self.refresh_credentials(exc):
+        except AuthError:
+            if not self.auto_refresh or not self.refresh_credentials():
                 raise
-            log("Retrying with refreshed credentials")
+            log("Retrying with the refreshed login")
             return fn()
 
-    def refresh_credentials(self, reason: Exception) -> bool:
+    def refresh_credentials(self) -> bool:
         with self._refresh_lock:
             now = time.monotonic()
-            if now - self._refresh_ok_at < 60:
+            if now - self._refresh_ok_at < 30:
                 return True  # another request refreshed a moment ago
-            if now - self._refresh_failed_at < 300:
+            if now - self._refresh_failed_at < 30:
                 return False
             try:
-                ok = headless_refresh(self.store, auth_failure=isinstance(reason, AuthError))
+                ok = refresh_from_browser_profile(self.store)
             except Exception as exc:  # noqa: BLE001 - never let a refresh attempt crash a request
-                debug(f"Headless refresh failed: {exc!r}")
+                debug(f"Login refresh failed: {exc!r}")
                 ok = False
             if ok:
                 self._refresh_ok_at = time.monotonic()
@@ -3697,149 +3669,485 @@ class ApiHandler(BaseHTTPRequestHandler):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Browser login over the Chrome DevTools Protocol
+# Login: read the token from a browser profile on disk
 #
-# The browser is started as a normal process with a dedicated profile and
-# --remote-debugging-port, WITHOUT automation flags, and nothing attaches to a page
-# until it is on chat.deepseek.com. That matters for "Sign in with Google", which
-# refuses browsers driven by automation tools. Once the page has a userToken in
-# localStorage, the token, cookies and browser fingerprint are saved and the
-# browser is closed. The profile is kept, so later logins are usually instant.
+# Nothing here remote-controls a browser. DeepSeek's sign-in captcha and "Sign in
+# with Google" reject browsers that are driven through DevTools, so instead:
+#   1. a login you already have in Chrome / Edge / Brave / ... is reused by reading
+#      that profile's chat.deepseek.com localStorage files, or
+#   2. a normal browser window opens with a dedicated profile, and the script watches
+#      that profile's files until the userToken appears after you sign in.
+# Chromium keeps localStorage in SQLite (<profile>/LocalStorage, newer profiles) or in
+# LevelDB (<profile>/Local Storage/leveldb); both are read with the standard library.
 # ════════════════════════════════════════════════════════════════════════════
 
+LS_TOKEN_KEY = "userToken"
+LS_DEVICE_KEY = "deepseek-device-id:chat"
+LOGIN_PATH = "/sign_in"
 
-class CDPError(Exception):
-    pass
+
+def _read_varint(buf: bytes, pos: int) -> Tuple[int, int]:
+    result = shift = 0
+    while True:
+        byte = buf[pos]
+        pos += 1
+        result |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return result, pos
+        shift += 7
+        if shift > 63:
+            raise ValueError("varint too long")
 
 
-class CDPSocket:
-    """Minimal RFC 6455 websocket client: enough for Chrome DevTools on 127.0.0.1."""
-
-    _GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-
-    def __init__(self, ws_url: str, timeout: float = 15.0):
-        parts = urllib.parse.urlsplit(ws_url)
-        if parts.scheme != "ws" or not parts.hostname:
-            raise CDPError(f"Unsupported DevTools endpoint: {ws_url}")
-        host, port = parts.hostname, parts.port or 80
-        self.sock = socket.create_connection((host, port), timeout=timeout)
-        self.sock.settimeout(timeout)
-        self._buf = bytearray()
-        self._next_id = 0
-        key = base64.b64encode(os.urandom(16)).decode("ascii")
-        target = parts.path + (f"?{parts.query}" if parts.query else "")
-        request = (
-            f"GET {target} HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-            f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
-        )
-        try:
-            self.sock.sendall(request.encode("ascii"))
-            while b"\r\n\r\n" not in self._buf:
-                chunk = self.sock.recv(4096)
-                if not chunk:
-                    raise CDPError("DevTools closed the connection during the handshake")
-                self._buf += chunk
-        except OSError:
-            self.close()
-            raise
-        head, _, rest = bytes(self._buf).partition(b"\r\n\r\n")
-        self._buf = bytearray(rest)
-        lines = head.decode("latin-1").split("\r\n")
-        if len(lines[0].split()) < 2 or lines[0].split()[1] != "101":
-            self.close()
-            raise CDPError(f"DevTools websocket handshake failed: {lines[0]}")
-        accept = base64.b64encode(hashlib.sha1((key + self._GUID).encode("ascii")).digest()).decode("ascii")
-        headers = {k.strip().lower(): v.strip() for k, _, v in (line.partition(":") for line in lines[1:])}
-        if headers.get("sec-websocket-accept") != accept:
-            self.close()
-            raise CDPError("DevTools websocket accept key mismatch")
-
-    def __enter__(self) -> "CDPSocket":
-        return self
-
-    def __exit__(self, *exc: Any) -> None:
-        self.close()
-
-    def _read_exact(self, n: int) -> bytes:
-        while len(self._buf) < n:
-            chunk = self.sock.recv(max(65536, n - len(self._buf)))
-            if not chunk:
-                raise CDPError("DevTools connection closed")
-            self._buf += chunk
-        out = bytes(self._buf[:n])
-        del self._buf[:n]
-        return out
-
-    def _send_frame(self, opcode: int, payload: bytes) -> None:
-        header = bytearray([0x80 | opcode])
-        size = len(payload)
-        if size < 126:
-            header.append(0x80 | size)
-        elif size < 65536:
-            header.append(0x80 | 126)
-            header += struct.pack("!H", size)
+def snappy_decompress(data: bytes) -> bytes:
+    """Raw Snappy, as used for LevelDB table blocks."""
+    size, pos = _read_varint(data, 0)
+    out = bytearray()
+    end = len(data)
+    while pos < end:
+        tag = data[pos]
+        pos += 1
+        kind = tag & 3
+        if kind == 0:  # literal
+            length = tag >> 2
+            if length >= 60:
+                extra = length - 59
+                length = int.from_bytes(data[pos : pos + extra], "little")
+                pos += extra
+            length += 1
+            if pos + length > end:
+                raise ValueError("truncated snappy literal")
+            out += data[pos : pos + length]
+            pos += length
+            continue
+        if kind == 1:
+            length = ((tag >> 2) & 7) + 4
+            offset = ((tag >> 5) << 8) | data[pos]
+            pos += 1
+        elif kind == 2:
+            length = (tag >> 2) + 1
+            offset = int.from_bytes(data[pos : pos + 2], "little")
+            pos += 2
         else:
-            header.append(0x80 | 127)
-            header += struct.pack("!Q", size)
-        mask = os.urandom(4)
-        header += mask
-        self.sock.sendall(bytes(header) + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+            length = (tag >> 2) + 1
+            offset = int.from_bytes(data[pos : pos + 4], "little")
+            pos += 4
+        if not 0 < offset <= len(out):
+            raise ValueError("bad snappy copy offset")
+        start = len(out) - offset
+        if offset >= length:
+            out += out[start : start + length]
+        else:  # overlapping copy repeats the last `offset` bytes
+            for i in range(length):
+                out.append(out[start + i])
+    if len(out) != size:
+        raise ValueError("snappy length mismatch")
+    return bytes(out)
 
-    def _recv_text(self) -> str:
-        parts: List[bytes] = []
-        while True:
-            b0, b1 = self._read_exact(2)
-            opcode = b0 & 0x0F
-            size = b1 & 0x7F
-            if size == 126:
-                size = struct.unpack("!H", self._read_exact(2))[0]
-            elif size == 127:
-                size = struct.unpack("!Q", self._read_exact(8))[0]
-            mask = self._read_exact(4) if b1 & 0x80 else None
-            payload = self._read_exact(size)
-            if mask:
-                payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-            if opcode == 0x9:  # ping
-                self._send_frame(0xA, payload)
-                continue
-            if opcode == 0xA:
-                continue
-            if opcode == 0x8:
-                raise CDPError("DevTools closed the websocket")
-            parts.append(payload)
-            if b0 & 0x80:
-                return b"".join(parts).decode("utf-8", "replace")
 
-    def send(self, method: str, params: Optional[Dict[str, Any]] = None) -> int:
-        self._next_id += 1
-        message = {"id": self._next_id, "method": method, "params": params or {}}
-        self._send_frame(0x1, json.dumps(message).encode("utf-8"))
-        return self._next_id
+def _leveldb_batch_entries(record: bytes) -> Iterator[Tuple[int, bytes, Optional[bytes]]]:
+    sequence = int.from_bytes(record[:8], "little")
+    count = int.from_bytes(record[8:12], "little")
+    pos = 12
+    for i in range(count):
+        tag = record[pos]
+        pos += 1
+        key_len, pos = _read_varint(record, pos)
+        key = record[pos : pos + key_len]
+        pos += key_len
+        if tag == 1:
+            value_len, pos = _read_varint(record, pos)
+            yield sequence + i, key, record[pos : pos + value_len]
+            pos += value_len
+        elif tag == 0:
+            yield sequence + i, key, None
+        else:
+            return
 
-    def call(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        message_id = self.send(method, params)
-        while True:
-            message = json.loads(self._recv_text())
-            if message.get("id") == message_id:
-                if "error" in message:
-                    raise CDPError(f"{method}: {message['error'].get('message')}")
-                return message.get("result") or {}
 
-    def close(self) -> None:
+def _leveldb_log_entries(data: bytes) -> Iterator[Tuple[int, bytes, Optional[bytes]]]:
+    """(sequence, key, value or None for a delete) from a LevelDB write-ahead log."""
+    block_size = 32768
+    pos = 0
+    pending: Optional[bytearray] = None
+    while pos + 7 <= len(data):
+        left = block_size - pos % block_size
+        if left < 7:
+            pos += left
+            continue
+        length = data[pos + 4] | (data[pos + 5] << 8)
+        kind = data[pos + 6]
+        start, end = pos + 7, pos + 7 + length
+        if end > len(data):
+            return  # torn write at the end of a log that is still being written
+        if kind == 0 or length > left - 7:
+            pos += left  # zero padding / corruption: continue at the next block
+            continue
+        fragment = data[start:end]
+        pos = end
+        if kind == 1:
+            yield from _leveldb_batch_entries(fragment)
+        elif kind == 2:
+            pending = bytearray(fragment)
+        elif kind == 3 and pending is not None:
+            pending += fragment
+        elif kind == 4 and pending is not None:
+            pending += fragment
+            record, pending = bytes(pending), None
+            yield from _leveldb_batch_entries(record)
+
+
+_LEVELDB_TABLE_MAGIC = (0xDB4775248B80FB57).to_bytes(8, "little")
+
+
+def _leveldb_block(data: bytes, handle: bytes) -> bytes:
+    offset, pos = _read_varint(handle, 0)
+    size, _ = _read_varint(handle, pos)
+    raw = data[offset : offset + size]
+    compression = data[offset + size]
+    if compression == 1:
+        return snappy_decompress(raw)
+    if compression == 0:
+        return raw
+    raise ValueError("unsupported LevelDB block compression")
+
+
+def _leveldb_block_entries(block: bytes) -> Iterator[Tuple[bytes, bytes]]:
+    restarts = int.from_bytes(block[-4:], "little")
+    limit = len(block) - 4 - 4 * restarts
+    pos = 0
+    key = b""
+    while pos < limit:
+        shared, pos = _read_varint(block, pos)
+        unshared, pos = _read_varint(block, pos)
+        value_len, pos = _read_varint(block, pos)
+        key = key[:shared] + block[pos : pos + unshared]
+        pos += unshared
+        yield key, block[pos : pos + value_len]
+        pos += value_len
+
+
+def _leveldb_table_entries(data: bytes, prefix: bytes) -> Iterator[Tuple[int, bytes, Optional[bytes]]]:
+    """Entries of a LevelDB table (.ldb) whose user key may start with `prefix`."""
+    if len(data) < 48 or data[-8:] != _LEVELDB_TABLE_MAGIC:
+        return
+    footer = data[-48:]
+    _, pos = _read_varint(footer, 0)  # skip the metaindex handle
+    _, pos = _read_varint(footer, pos)
+    index = _leveldb_block(data, footer[pos:])
+    upper_bound = prefix + b"0"  # wanted keys continue with "\x00" or "/", both below "0"
+    previous = b""
+    for separator, handle in _leveldb_block_entries(index):
+        block_max = separator[:-8]  # index keys are internal keys: user key + 8-byte tag
+        if block_max >= prefix and previous < upper_bound:
+            for internal_key, value in _leveldb_block_entries(_leveldb_block(data, handle)):
+                if len(internal_key) < 8:
+                    continue
+                tag = int.from_bytes(internal_key[-8:], "little")
+                yield tag >> 8, internal_key[:-8], value if tag & 0xFF == 1 else None
+        previous = block_max
+
+
+def _storage_key_names(names: Tuple[str, ...]) -> Dict[bytes, str]:
+    """localStorage keys are stored with an encoding byte: 1 = Latin-1, 0 = UTF-16LE."""
+    wanted: Dict[bytes, str] = {}
+    for name in names:
+        wanted[b"\x01" + name.encode("latin-1")] = name
+        wanted[b"\x00" + name.encode("utf-16-le")] = name
+    return wanted
+
+
+def _decode_storage_value(raw: Optional[bytes], compression: int = 0) -> Optional[str]:
+    if raw is None:
+        return None
+    if compression == 1:  # zstd, used by the SQLite backend for larger values
         try:
-            self._send_frame(0x8, b"")
-        except OSError:
-            pass
+            from compression import zstd  # type: ignore[import-not-found]  # Python 3.14+
+
+            raw = zstd.decompress(raw)
+        except Exception:  # noqa: BLE001 - tokens are small and stored uncompressed
+            return None
+    elif compression:
+        return None
+    if not raw:
+        return ""
+    try:
+        if raw[0] == 1:
+            return raw[1:].decode("latin-1")
+        if raw[0] == 0:
+            return raw[1:].decode("utf-16-le")
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _read_leveldb_storage(directory: Path, origin: str, names: Tuple[str, ...]) -> Dict[str, str]:
+    prefix = b"_" + origin.encode("utf-8")
+    wanted = _storage_key_names(names)
+    newest: Dict[str, Tuple[int, Optional[bytes]]] = {}
+    paths = sorted(directory.glob("*.ldb")) + sorted(directory.glob("*.sst")) + sorted(directory.glob("*.log"))
+    for path in paths:
         try:
-            self.sock.close()
+            data = path.read_bytes()
         except OSError:
-            pass
+            continue
+        entries = _leveldb_log_entries(data) if path.suffix == ".log" else _leveldb_table_entries(data, prefix)
+        try:
+            for sequence, key, value in entries:
+                if not key.startswith(prefix):
+                    continue
+                rest = key[len(prefix) :]
+                if rest[:1] == b"/":
+                    rest = rest[1:]
+                name = wanted.get(rest[1:]) if rest[:1] == b"\x00" else None
+                if name and (name not in newest or sequence >= newest[name][0]):
+                    newest[name] = (sequence, value)
+        except (ValueError, IndexError):
+            continue  # torn or unexpected data: keep what was read so far
+    out: Dict[str, str] = {}
+    for name, (_, value) in newest.items():
+        text = _decode_storage_value(value)
+        if text is not None:
+            out[name] = text
+    return out
 
 
-def _devtools_json(port: int, path: str, method: str = "GET", timeout: float = 5.0) -> Any:
-    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method=method)
-    with _direct_opener.open(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+def _read_sqlite_storage(path: Path, origin: str, names: Tuple[str, ...]) -> Dict[str, str]:
+    import sqlite3
+
+    # Work on a copy: the browser keeps the database open (and locked) while it runs.
+    tmp = Path(tempfile.mkdtemp(prefix="dswebapi-"))
+    out: Dict[str, str] = {}
+    try:
+        for suffix in ("", "-wal", "-journal"):
+            source = Path(str(path) + suffix)
+            if source.is_file():
+                shutil.copyfile(str(source), str(tmp / ("LocalStorage" + suffix)))
+        con = sqlite3.connect(str(tmp / "LocalStorage"))
+        try:
+            keys = [(origin + "/").encode("utf-8"), origin.encode("utf-8")]
+            row = con.execute("SELECT row_id FROM maps WHERE storage_key IN (?, ?)", keys).fetchone()
+            if row:
+                for encoded, name in _storage_key_names(names).items():
+                    if name in out:
+                        continue
+                    found = con.execute(
+                        "SELECT value_compression_type, value FROM map_entries WHERE map_id = ? AND key = ?",
+                        (row[0], encoded),
+                    ).fetchone()
+                    if found:
+                        text = _decode_storage_value(bytes(found[1]), int(found[0] or 0))
+                        if text is not None:
+                            out[name] = text
+        finally:
+            con.close()
+    except (OSError, sqlite3.Error) as exc:
+        debug(f"Could not read {path}: {exc}")
+    finally:
+        shutil.rmtree(str(tmp), ignore_errors=True)
+    return out
+
+
+def read_profile_storage(profile: Path, origin: Optional[str] = None) -> Dict[str, str]:
+    """chat.deepseek.com's userToken and device id from one Chromium profile folder."""
+    origin = origin or DEEPSEEK_BASE
+    names = (LS_TOKEN_KEY, LS_DEVICE_KEY)
+    values: Dict[str, str] = {}
+    if (profile / "LocalStorage").is_file():
+        values = _read_sqlite_storage(profile / "LocalStorage", origin, names)
+    leveldb = profile / "Local Storage" / "leveldb"
+    if leveldb.is_dir() and LS_TOKEN_KEY not in values:  # older profiles; SQLite wins when both exist
+        for name, value in _read_leveldb_storage(leveldb, origin, names).items():
+            values.setdefault(name, value)
+    return values
+
+
+def _plain_value(raw: Any) -> Optional[str]:
+    """localStorage values are either plain strings or {"value": ...} JSON wrappers."""
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    text = raw.strip()
+    if text.startswith("{"):
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            return None
+        value = parsed.get("value") if isinstance(parsed, dict) else None
+        return value.strip() if isinstance(value, str) and value.strip() else None
+    return text.strip('"') or None
+
+
+def client_locale(preference: Optional[str], languages: List[Any]) -> Optional[str]:
+    """x-client-locale: the app's language setting, or (when it is "system") the browser's,
+    e.g. "tr" for tr-TR, "en_US" for English, "zh_CN" for Chinese."""
+    if preference and re.fullmatch(r"[a-z]{2,3}(?:[_-][A-Za-z]{2,4})?", preference):
+        return preference
+    first = next((lang for lang in languages if isinstance(lang, str) and lang.strip()), "")
+    primary = first.strip().split("-")[0].lower()
+    if not re.fullmatch(r"[a-z]{2,3}", primary):
+        return None
+    return {"en": "en_US", "zh": "zh_CN"}.get(primary, primary)
+
+
+def accept_language_header(languages: List[Any]) -> str:
+    langs = [lang.strip() for lang in languages if isinstance(lang, str) and lang.strip()][:8]
+    parts = [lang if i == 0 else f"{lang};q={max(0.1, 1 - i / 10):.1f}" for i, lang in enumerate(langs)]
+    return ",".join(parts) or "en-US,en;q=0.9"
+
+
+def _profile_languages(profile: Path) -> Dict[str, str]:
+    """Accept-Language / x-client-locale from the profile's language settings."""
+    try:
+        prefs = json.loads((profile / "Preferences").read_text(encoding="utf-8"))
+        languages = str(prefs["intl"]["accept_languages"]).split(",")
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+    out = {"accept_language": accept_language_header(languages)}
+    locale = client_locale(None, languages)
+    if locale:
+        out["locale"] = locale
+    return out
+
+
+def _user_agent_for(browser: str, user_data_dir: Path) -> str:
+    """A user agent matching the browser that holds the login (version from "Last Version")."""
+    try:
+        major = (user_data_dir / "Last Version").read_text(encoding="utf-8").strip().split(".")[0]
+    except OSError:
+        major = ""
+    if not major.isdigit() or not browser.startswith(("Google Chrome", "Microsoft Edge", "Brave", "Chromium")):
+        return DEFAULT_USER_AGENT
+    if os.name == "nt":
+        platform = "Windows NT 10.0; Win64; x64"
+    elif sys.platform == "darwin":
+        platform = "Macintosh; Intel Mac OS X 10_15_7"
+    else:
+        platform = "X11; Linux x86_64"
+    agent = f"Mozilla/5.0 ({platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+    return agent + (f" Edg/{major}.0.0.0" if browser.startswith("Microsoft Edge") else "")
+
+
+def browser_user_data_dirs() -> List[Tuple[str, Path]]:
+    """(browser name, user data folder) for installed Chromium-based browsers."""
+    home = Path.home()
+    if os.name == "nt":
+        local = Path(os.environ.get("LOCALAPPDATA") or home / "AppData" / "Local")
+        roaming = Path(os.environ.get("APPDATA") or home / "AppData" / "Roaming")
+        candidates = [
+            ("Google Chrome", local / "Google" / "Chrome" / "User Data"),
+            ("Google Chrome Beta", local / "Google" / "Chrome Beta" / "User Data"),
+            ("Google Chrome Canary", local / "Google" / "Chrome SxS" / "User Data"),
+            ("Microsoft Edge", local / "Microsoft" / "Edge" / "User Data"),
+            ("Microsoft Edge Beta", local / "Microsoft" / "Edge Beta" / "User Data"),
+            ("Brave", local / "BraveSoftware" / "Brave-Browser" / "User Data"),
+            ("Chromium", local / "Chromium" / "User Data"),
+            ("Vivaldi", local / "Vivaldi" / "User Data"),
+            ("Opera", roaming / "Opera Software" / "Opera Stable"),
+            ("Opera GX", roaming / "Opera Software" / "Opera GX Stable"),
+        ]
+    elif sys.platform == "darwin":
+        base = home / "Library" / "Application Support"
+        candidates = [
+            ("Google Chrome", base / "Google" / "Chrome"),
+            ("Microsoft Edge", base / "Microsoft Edge"),
+            ("Brave", base / "BraveSoftware" / "Brave-Browser"),
+            ("Chromium", base / "Chromium"),
+            ("Vivaldi", base / "Vivaldi"),
+            ("Opera", base / "com.operasoftware.Opera"),
+        ]
+    else:
+        config = Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config")
+        candidates = [
+            ("Google Chrome", config / "google-chrome"),
+            ("Microsoft Edge", config / "microsoft-edge"),
+            ("Brave", config / "BraveSoftware" / "Brave-Browser"),
+            ("Chromium", config / "chromium"),
+            ("Vivaldi", config / "vivaldi"),
+            ("Opera", config / "opera"),
+        ]
+    return [(name, path) for name, path in candidates if path.is_dir()]
+
+
+def browser_profiles(user_data_dir: Path) -> List[Path]:
+    def has_storage(folder: Path) -> bool:
+        return (folder / "LocalStorage").is_file() or (folder / "Local Storage").is_dir()
+
+    profiles = [user_data_dir] if has_storage(user_data_dir) else []  # Opera keeps one at the root
+    try:
+        children = sorted(user_data_dir.iterdir())
+    except OSError:
+        return profiles
+    for child in children:
+        if child.is_dir() and (child.name == "Default" or child.name.startswith("Profile ")) and has_storage(child):
+            profiles.append(child)
+    return profiles
+
+
+class _MemoryStore:
+    """Stand-in for CredentialStore when checking a token before saving it."""
+
+    env_token = None
+
+    def __init__(self, creds: Dict[str, Any]):
+        self._creds = creds
+
+    def get(self) -> Dict[str, Any]:
+        return dict(self._creds)
+
+
+def probe_token(token: str, creds: Optional[Dict[str, Any]] = None) -> Optional[bool]:
+    """True if DeepSeek accepts the token, False if it rejects it, None if it couldn't be checked."""
+    client = DeepSeekClient(_MemoryStore({**(creds or {}), "token": token}))  # type: ignore[arg-type]
+    try:
+        client.access_token(force=True)
+        return True
+    except AuthError:
+        return False
+    except UpstreamError as exc:
+        debug(f"Could not check a token: {exc}")
+        return None
+
+
+def find_browser_logins() -> List[Dict[str, Any]]:
+    """DeepSeek logins found in the localStorage of installed browsers' profiles."""
+    found: List[Dict[str, Any]] = []
+    seen = set()
+    for browser, user_data_dir in browser_user_data_dirs():
+        for profile in browser_profiles(user_data_dir):
+            try:
+                values = read_profile_storage(profile)
+            except Exception as exc:  # noqa: BLE001 - one unreadable profile shouldn't stop the search
+                debug(f"Could not read {profile}: {exc!r}")
+                continue
+            token = extract_user_token(values.get(LS_TOKEN_KEY))
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            creds: Dict[str, Any] = {
+                "token": token,
+                "device_id": _plain_value(values.get(LS_DEVICE_KEY)) or str(uuid.uuid4()),
+                "user_agent": _user_agent_for(browser, user_data_dir),
+                "source": {"type": "browser", "browser": browser, "profile": str(profile)},
+                "saved_at": int(time.time()),
+            }
+            creds.update(_profile_languages(profile))
+            found.append(creds)
+    return found
+
+
+def import_browser_login() -> Optional[Dict[str, Any]]:
+    for creds in find_browser_logins():
+        source = creds["source"]
+        label = f"{source['browser']} (profile \"{Path(source['profile']).name}\")"
+        verdict = probe_token(creds["token"], creds)
+        if verdict:
+            say(f"Found a working DeepSeek login in {label}.")
+            return creds
+        if verdict is False:
+            say(f"Skipping the expired DeepSeek login in {label}.")
+        else:
+            say(f"Could not check the DeepSeek login in {label} (network problem); skipping it.")
+    return None
 
 
 def _windows_app_path(exe_name: str) -> Optional[str]:
@@ -3860,7 +4168,8 @@ def _windows_app_path(exe_name: str) -> Optional[str]:
 
 
 def browser_candidates() -> List[Tuple[str, str]]:
-    """Installed Chromium-based browsers as (kind, executable), preferred first."""
+    """Installed Chromium-based browsers as (kind, executable). Real Chrome / Edge / Brave come
+    first: captchas trust them more than plain Chromium builds."""
     found: List[Tuple[str, str]] = []
 
     def add(kind: str, path: Optional[str]) -> None:
@@ -3872,8 +4181,6 @@ def browser_candidates() -> List[Tuple[str, str]]:
         program_files_x86 = os.environ.get("ProgramFiles(x86)") or r"C:\Program Files (x86)"
         local = os.environ.get("LOCALAPPDATA") or ""
         bases = [b for b in (local, program_files, program_files_x86) if b]
-        for base in bases:
-            add("chromium", os.path.join(base, "Chromium", "Application", "chrome.exe"))
         add("chrome", _windows_app_path("chrome.exe"))
         for base in bases:
             add("chrome", os.path.join(base, "Google", "Chrome", "Application", "chrome.exe"))
@@ -3882,14 +4189,16 @@ def browser_candidates() -> List[Tuple[str, str]]:
             add("edge", os.path.join(base, "Microsoft", "Edge", "Application", "msedge.exe"))
         for base in bases:
             add("brave", os.path.join(base, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"))
+        for base in bases:
+            add("chromium", os.path.join(base, "Chromium", "Application", "chrome.exe"))
         playwright_root = os.path.join(local, "ms-playwright") if local else ""
         playwright_globs = ["chromium-*/*/chrome.exe"]
     elif sys.platform == "darwin":
         apps = (
-            ("chromium", "Chromium.app/Contents/MacOS/Chromium"),
             ("chrome", "Google Chrome.app/Contents/MacOS/Google Chrome"),
             ("edge", "Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
             ("brave", "Brave Browser.app/Contents/MacOS/Brave Browser"),
+            ("chromium", "Chromium.app/Contents/MacOS/Chromium"),
         )
         for kind, rel in apps:
             for root in ("/Applications", os.path.expanduser("~/Applications")):
@@ -3898,10 +4207,10 @@ def browser_candidates() -> List[Tuple[str, str]]:
         playwright_globs = ["chromium-*/*/*.app/Contents/MacOS/*"]
     else:
         names = (
-            ("chromium", ("chromium", "chromium-browser")),
             ("chrome", ("google-chrome", "google-chrome-stable")),
             ("edge", ("microsoft-edge", "microsoft-edge-stable")),
             ("brave", ("brave-browser", "brave")),
+            ("chromium", ("chromium", "chromium-browser")),
         )
         for kind, executables in names:
             for name in executables:
@@ -3957,310 +4266,130 @@ def _profile_in_use(profile: Path) -> bool:
         return True
 
 
-_PROBE_JS = r"""(() => {
-  const read = (k) => { try { return window.localStorage.getItem(k); } catch (e) { return null; } };
-  const uad = navigator.userAgentData || null;
-  return JSON.stringify({
-    token: read("userToken"),
-    deviceId: read("deepseek-device-id:chat"),
-    locale: read("__appKit_@deepseek/chat_localePreference"),
-    ua: navigator.userAgent,
-    brands: uad && uad.brands ? uad.brands : null,
-    platform: uad && uad.platform ? uad.platform : null,
-    languages: navigator.languages ? Array.from(navigator.languages) : [],
-    scripts: Array.from(document.scripts).map((s) => s.src).filter(Boolean)
-  });
-})()"""
+def launch_browser(
+    exe: str, profile: Path, url: str, headless: bool = False, extra_args: Tuple[str, ...] = ()
+) -> subprocess.Popen:
+    """Start the browser like a desktop shortcut would: no DevTools port, no automation flags."""
+    args = [exe, f"--user-data-dir={profile}", "--no-first-run", "--no-default-browser-check", *extra_args]
+    if headless:  # only used by the tests
+        args.append("--headless=new")
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        args.append("--no-sandbox")  # Chromium refuses to run as root otherwise (Linux containers)
+    args.append(url)
+    kwargs: Dict[str, Any] = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        return subprocess.Popen(args, **kwargs)
+    except OSError as exc:
+        raise LoginError(f"Could not start the browser ({exe}): {exc}") from None
 
 
-class BrowserSession:
-    def __init__(self, exe: str, profile: Path, headless: bool = False, user_agent: Optional[str] = None):
-        self.exe = exe
-        self.profile = profile
-        self.headless = headless
-        self.user_agent = user_agent
-        self.proc: Optional[subprocess.Popen] = None
-        self.port: Optional[int] = None
-        self.reused = False
-
-    def _read_port(self) -> Optional[int]:
-        try:
-            first = (self.profile / "DevToolsActivePort").read_text(encoding="utf-8").splitlines()[0].strip()
-        except (OSError, IndexError):
-            return None
-        return int(first) if first.isdigit() else None
-
-    @staticmethod
-    def _responds(port: int) -> bool:
-        try:
-            _devtools_json(port, "/json/version", timeout=2)
-            return True
-        except Exception:  # noqa: BLE001
-            return False
-
-    def alive(self) -> bool:
-        if self.proc is not None and self.proc.poll() is None:
-            return True
-        return bool(self.port) and self._responds(self.port)  # type: ignore[arg-type]
-
-    def start(self, url: str, timeout: float = 30.0) -> None:
-        self.profile.mkdir(parents=True, exist_ok=True)
-        port = self._read_port()
-        if port and self._responds(port):  # our browser from an earlier run is still open
-            self.port, self.reused = port, True
-            self.open_tab(url)
-            return
-        if _profile_in_use(self.profile):
-            raise LoginError(
-                "The DeepSeek login profile is open in another browser window. Close it and try again."
-            )
-        try:
-            (self.profile / "DevToolsActivePort").unlink()
-        except OSError:
-            pass
-        args = [
-            self.exe,
-            f"--user-data-dir={self.profile}",
-            "--remote-debugging-port=0",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-search-engine-choice-screen",
-        ]
-        if self.headless:
-            args += ["--headless=new", "--window-size=1280,900", "--mute-audio"]
-            if self.user_agent:
-                args.append("--user-agent=" + self.user_agent.replace("HeadlessChrome", "Chrome"))
-        if hasattr(os, "geteuid") and os.geteuid() == 0:
-            args.append("--no-sandbox")  # Chromium refuses to run as root otherwise (Linux containers)
-        args.append(url)
-        kwargs: Dict[str, Any] = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
-        if os.name == "nt":
-            kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+def close_browser(proc: subprocess.Popen, timeout: float = 10.0, force: bool = False) -> bool:
+    """Ask the browser to quit the way closing its window would, so it saves its profile."""
+    if proc.poll() is not None:
+        return True
+    try:
+        if os.name == "nt":  # taskkill without /F sends the windows a normal close request
+            subprocess.run(["taskkill", "/PID", str(proc.pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
         else:
-            kwargs["start_new_session"] = True
-        try:
-            self.proc = subprocess.Popen(args, **kwargs)
-        except OSError as exc:
-            raise LoginError(f"Could not start the browser ({self.exe}): {exc}") from None
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            port = self._read_port()
-            if port and self._responds(port):
-                self.port = port
-                return
-            if self.proc.poll() not in (None, 0):
-                raise LoginError(f"The browser exited right away (exit code {self.proc.returncode}).")
-            time.sleep(0.25)
-        raise LoginError("The browser did not open its DevTools port in time.")
-
-    def open_tab(self, url: str) -> None:
-        for method in ("PUT", "GET"):
-            try:
-                _devtools_json(self.port, "/json/new?" + url, method=method)  # type: ignore[arg-type]
-                return
-            except Exception:  # noqa: BLE001
-                continue
-
-    def probe(self) -> Optional[Dict[str, Any]]:
-        """The login data from a chat.deepseek.com tab, once it holds a userToken."""
-        try:
-            targets = _devtools_json(self.port, "/json/list")  # type: ignore[arg-type]
-        except Exception as exc:  # noqa: BLE001
-            debug(f"DevTools target list unavailable: {exc}")
-            return None
-        site = urllib.parse.urlsplit(DEEPSEEK_BASE).hostname
-        for target in targets if isinstance(targets, list) else []:
-            if not isinstance(target, dict) or target.get("type") != "page":
-                continue
-            if urllib.parse.urlsplit(str(target.get("url") or "")).hostname != site:
-                continue  # never touch other sites (e.g. the Google sign-in pages)
-            ws_url = target.get("webSocketDebuggerUrl")
-            if not ws_url:
-                continue
-            try:
-                with CDPSocket(ws_url, timeout=10) as ws:
-                    result = ws.call("Runtime.evaluate", {"expression": _PROBE_JS, "returnByValue": True})
-                    raw = (result.get("result") or {}).get("value")
-                    info = json.loads(raw) if isinstance(raw, str) else {}
-                    token = extract_user_token(info.get("token"))
-                    if not token:
-                        continue
-                    cookies = ws.call("Network.getCookies", {"urls": [DEEPSEEK_BASE + "/"]}).get("cookies") or []
-            except (CDPError, OSError, ValueError) as exc:
-                debug(f"Probe of {target.get('url')} failed: {exc}")
-                continue
-            info["token"] = token
-            info["cookies"] = cookies
-            return info
-        return None
-
-    def close(self, include_reused: bool = True) -> None:
-        if self.port and (include_reused or not self.reused):
-            try:
-                version = _devtools_json(self.port, "/json/version", timeout=3)
-                with CDPSocket(version["webSocketDebuggerUrl"], timeout=5) as ws:
-                    ws.send("Browser.close")  # a clean exit flushes cookies/localStorage to the profile
-                    time.sleep(0.5)
-            except Exception as exc:  # noqa: BLE001
-                debug(f"Browser.close failed: {exc}")
-        if self.proc is not None:
-            try:
-                self.proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.proc.terminate()
-                try:
-                    self.proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self.proc.kill()
+            proc.terminate()  # SIGTERM: Chromium shuts down cleanly
+        proc.wait(timeout=timeout)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        if force:
+            proc.kill()
+            return True
+        return proc.poll() is not None
 
 
-def browser_capture(
+def window_login(
     exe: str,
     profile: Path,
+    timeout: float = 300.0,
     *,
     headless: bool = False,
-    timeout: float = 300.0,
-    user_agent: Optional[str] = None,
-    keep_open: bool = False,
+    extra_args: Tuple[str, ...] = (),
 ) -> Dict[str, Any]:
-    session = BrowserSession(exe, profile, headless=headless, user_agent=user_agent)
-    session.start(DEEPSEEK_BASE + "/")
-    try:
-        deadline = time.monotonic() + timeout
-        while True:
-            info = session.probe()
-            if info:
-                return info
-            if time.monotonic() > deadline:
-                raise LoginError("Timed out waiting for the DeepSeek login.")
-            if not session.alive():
-                raise LoginError("The browser was closed before the login finished.")
-            time.sleep(1.5)
-    finally:
-        if not keep_open:
-            session.close(include_reused=not headless)
+    """Open DeepSeek's sign-in page in a normal browser window and wait for the token
+    to land in the profile's localStorage files."""
+    profile.mkdir(parents=True, exist_ok=True)
+    storage = profile / "Default"
+    checked: set = set()
 
-
-def _plain_value(raw: Any) -> Optional[str]:
-    """localStorage values are either plain strings or {"value": ...} JSON wrappers."""
-    if not isinstance(raw, str) or not raw.strip():
-        return None
-    text = raw.strip()
-    if text.startswith("{"):
-        try:
-            parsed = json.loads(text)
-        except ValueError:
+    def captured() -> Optional[Dict[str, Any]]:
+        values = read_profile_storage(storage)
+        token = extract_user_token(values.get(LS_TOKEN_KEY))
+        if not token or token in checked:
             return None
-        value = parsed.get("value") if isinstance(parsed, dict) else None
-        return value.strip() if isinstance(value, str) and value.strip() else None
-    return text.strip('"') or None
-
-
-def client_locale(preference: Optional[str], languages: List[Any]) -> Optional[str]:
-    """x-client-locale: the app's language setting, or (when it is "system") the browser's,
-    e.g. "tr" for tr-TR, "en_US" for English, "zh_CN" for Chinese."""
-    if preference and re.fullmatch(r"[a-z]{2,3}(?:[_-][A-Za-z]{2,4})?", preference):
-        return preference
-    first = next((lang for lang in languages if isinstance(lang, str) and lang.strip()), "")
-    primary = first.strip().split("-")[0].lower()
-    if not re.fullmatch(r"[a-z]{2,3}", primary):
-        return None
-    return {"en": "en_US", "zh": "zh_CN"}.get(primary, primary)
-
-
-def accept_language_header(languages: List[Any]) -> str:
-    langs = [lang.strip() for lang in languages if isinstance(lang, str) and lang.strip()][:8]
-    parts = [lang if i == 0 else f"{lang};q={max(0.1, 1 - i / 10):.1f}" for i, lang in enumerate(langs)]
-    return ",".join(parts) or "en-US,en;q=0.9"
-
-
-def detect_client_version(scripts: Any) -> Optional[str]:
-    """Read appVersion from the web app's main bundle so x-client-version stays current."""
-    for src in scripts if isinstance(scripts, list) else []:
-        if not isinstance(src, str) or not re.match(r"^https://[a-z0-9.-]*deepseek\.com/\S*/main\.[0-9a-f]+\.js$", src):
-            continue
-        try:
-            req = urllib.request.Request(src, headers={"User-Agent": DEFAULT_USER_AGENT})
-            with _opener.open(req, timeout=20) as resp:
-                text = resp.read(16 * 1024 * 1024).decode("utf-8", "replace")
-        except (OSError, http.client.HTTPException) as exc:
-            debug(f"Could not read the web client version from {src}: {exc}")
-            continue
-        match = re.search(r'appVersion:"(\d+\.\d+\.\d+)"', text)
-        if match:
-            return match.group(1)
-    return None
-
-
-def _clean_cookies(cookies: Any) -> List[Dict[str, Any]]:
-    out = []
-    for cookie in cookies if isinstance(cookies, list) else []:
-        if not isinstance(cookie, dict):
-            continue
-        if not str(cookie.get("domain") or "").lstrip(".").endswith("deepseek.com"):
-            continue
-        out.append({k: cookie[k] for k in ("name", "value", "domain", "path", "expires", "secure", "httpOnly") if k in cookie})
-    return out
-
-
-def creds_from_browser(info: Dict[str, Any], exe: str, previous: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    creds = dict(previous or {})
-    user_agent = info.get("ua") if isinstance(info.get("ua"), str) and info.get("ua") else None
-    user_agent = (user_agent or creds.get("user_agent") or DEFAULT_USER_AGENT).replace("HeadlessChrome/", "Chrome/")
-    creds.update(
-        {
-            "token": info["token"],
-            "cookies": _clean_cookies(info.get("cookies")),
-            "user_agent": user_agent,
-            "browser": exe,
+        verdict = probe_token(token)
+        if verdict is not None:
+            checked.add(token)
+        if not verdict:
+            return None
+        creds: Dict[str, Any] = {
+            "token": token,
+            "device_id": _plain_value(values.get(LS_DEVICE_KEY)) or str(uuid.uuid4()),
+            "user_agent": _user_agent_for(_browser_name(exe), profile),
+            "source": {"type": "window", "browser": exe, "profile": str(storage)},
             "saved_at": int(time.time()),
         }
-    )
-    brands = info.get("brands")
-    if isinstance(brands, list) and brands and not any("headless" in str(b).lower() for b in brands):
-        creds["ua_brands"] = [
-            {"brand": str(b.get("brand")), "version": str(b.get("version") or "")}
-            for b in brands
-            if isinstance(b, dict) and b.get("brand")
-        ]
-    if isinstance(info.get("platform"), str) and info["platform"]:
-        creds["ua_platform"] = info["platform"]
-    languages = info.get("languages") if isinstance(info.get("languages"), list) else []
-    if languages:
-        creds["accept_language"] = accept_language_header(languages)
-    creds["device_id"] = _plain_value(info.get("deviceId")) or creds.get("device_id") or str(uuid.uuid4())
-    locale = client_locale(_plain_value(info.get("locale")), languages)
-    if locale:
-        creds["locale"] = locale
-    version = detect_client_version(info.get("scripts"))
-    if version:
-        creds["client_version"] = version
-    return creds
+        creds.update(_profile_languages(storage))
+        return creds
+
+    already_open = _profile_in_use(profile)
+    proc = launch_browser(exe, profile, DEEPSEEK_BASE + LOGIN_PATH, headless=headless, extra_args=extra_args)
+    deadline = time.monotonic() + timeout
+    creds = None
+    try:
+        while True:
+            time.sleep(2)
+            creds = captured()
+            if creds:
+                return creds
+            if proc.poll() is not None and not _profile_in_use(profile):
+                creds = captured()  # the browser writes its storage out when it closes
+                if creds:
+                    return creds
+                raise LoginError("The browser window was closed before the sign-in finished.")
+            if time.monotonic() > deadline:
+                raise LoginError("Timed out waiting for the DeepSeek sign-in.")
+    finally:
+        closed = close_browser(proc, force=headless)
+        if creds and (already_open or not closed):
+            say("Signed in. You can close the browser window now.")
 
 
-def headless_refresh(store: CredentialStore, auth_failure: bool) -> bool:
-    """Re-read the token and cookies from the saved browser profile without showing a window."""
+def _browser_name(exe: str) -> str:
+    lowered = os.path.basename(exe).lower()
+    if "msedge" in lowered or "microsoft edge" in lowered:
+        return "Microsoft Edge"
+    if "brave" in lowered:
+        return "Brave"
+    if "chromium" in lowered or "ms-playwright" in exe.lower():
+        return "Chromium"
+    return "Google Chrome" if "chrome" in lowered else "Chromium"
+
+
+def refresh_from_browser_profile(store: CredentialStore) -> bool:
+    """After DeepSeek rejects the saved token, pick up a newer one from the profile it came from."""
     if store.env_token:
         return False
     creds = store.get()
-    exe = creds.get("browser") if isinstance(creds.get("browser"), str) and os.path.isfile(creds["browser"]) else None
-    if not exe:
-        picked = pick_browser(None)
-        exe = picked[1] if picked else None
-    profile = browser_profile_dir()
-    if not exe or not profile.is_dir():
-        return False
-    log("Refreshing the DeepSeek session from the saved browser profile...")
+    source = creds.get("source") if isinstance(creds.get("source"), dict) else {}
+    profile = Path(source["profile"]) if isinstance(source.get("profile"), str) else browser_profile_dir() / "Default"
     try:
-        info = browser_capture(exe, profile, headless=True, timeout=45, user_agent=creds.get("user_agent"))
-    except LoginError as exc:
-        log(f"Session refresh failed: {exc}", "WARN")
+        values = read_profile_storage(profile)
+    except Exception as exc:  # noqa: BLE001
+        debug(f"Could not read {profile}: {exc!r}")
         return False
-    fresh = creds_from_browser(info, exe, previous=creds)
-    store.save(fresh)
-    if auth_failure and fresh["token"] == extract_user_token(creds.get("token")):
-        log("The browser profile holds the same rejected token. Run the 'login' command to sign in again.", "WARN")
+    token = extract_user_token(values.get(LS_TOKEN_KEY))
+    if not token or token == extract_user_token(creds.get("token")) or not probe_token(token, creds):
         return False
+    store.update(token=token, saved_at=int(time.time()))
+    log("Picked up a newer DeepSeek login from the browser profile.")
     return True
 
 
@@ -4346,29 +4475,40 @@ def cmd_login(args: argparse.Namespace) -> int:
     store = CredentialStore(credentials_path())
     if args.token is not None or args.manual:
         return _manual_login(store, args.token)
+    if not args.no_import and not args.browser:
+        say("Looking for a DeepSeek login in your browsers (Chrome, Edge, Brave, ...)...")
+        creds = import_browser_login()
+        if creds:
+            say("Using it. Signing out of DeepSeek in that browser also signs out this script.")
+            return _finish_login(store, creds)
+        say("None found, so a browser window will open for you to sign in.\n")
     picked = pick_browser(args.browser)
     if not picked:
         if args.browser:
             say(f"Browser not found: {args.browser}")
         else:
-            say("No Chromium-based browser found (looked for Chromium, Google Chrome, Microsoft Edge and Brave).")
+            say("No Chromium-based browser found (looked for Google Chrome, Microsoft Edge, Brave and Chromium).")
         say("Install one, pass --browser <path-to-browser.exe>, or paste a token with: login --manual")
         if sys.stdin is not None and sys.stdin.isatty():
             return _manual_login(store, None)
         return 1
     kind, exe = picked
     say(f"Opening {kind}: {exe}")
-    say("Sign in to DeepSeek in that window (Google, email or phone). It closes by itself once")
-    say(f"you are signed in. Waiting up to {int(args.timeout)} seconds; press Ctrl+C to cancel.")
+    say("Sign in to DeepSeek in that window (Google, email or phone). It is an ordinary browser")
+    say("window that nothing controls, so the captcha behaves as usual. It closes by itself a few")
+    say("seconds after you are signed in; if it doesn't, close it yourself and the login is picked up.")
+    say(f"Waiting up to {int(args.timeout)} seconds; press Ctrl+C to cancel.")
     try:
-        info = browser_capture(exe, browser_profile_dir(), timeout=args.timeout, keep_open=args.keep_open)
+        creds = window_login(exe, browser_profile_dir(), timeout=args.timeout)
     except LoginError as exc:
         say(f"Login failed: {exc}")
+        say("If the captcha keeps failing: sign in to chat.deepseek.com in the browser you normally")
+        say("use and run 'login' again (it reuses that login), or paste a token with 'login --manual'.")
         return 1
     except KeyboardInterrupt:
         say("Cancelled.")
         return 130
-    return _finish_login(store, creds_from_browser(info, exe))
+    return _finish_login(store, creds)
 
 
 def _remove_tree(path: Path) -> None:
@@ -4402,11 +4542,17 @@ def cmd_status(args: argparse.Namespace) -> int:
     store = CredentialStore(credentials_path(), env_token=os.environ.get("DEEPSEEK_USER_TOKEN"))
     creds = store.get()
     token = extract_user_token(creds.get("token"))
-    picked = pick_browser(None)
+    source = creds.get("source") if isinstance(creds.get("source"), dict) else {}
+    if source.get("type") == "browser":
+        origin = f"{source.get('browser')} (profile \"{Path(str(source.get('profile'))).name}\")"
+    elif source.get("type") == "window":
+        origin = "the login browser window"
+    else:
+        origin = "pasted token" if token else "-"
     say(f"Data folder     : {app_dir()}")
     say(f"Credentials     : {store.path} ({'found' if store.path.exists() else 'not found'})")
     say(f"Token           : {mask_secret(token)}{' (from DEEPSEEK_USER_TOKEN)' if store.env_token else ''}")
-    say(f"Login browser   : {creds.get('browser') or (picked[1] if picked else 'none found')}")
+    say(f"Login from      : {origin}")
     say(f"Client version  : {creds.get('client_version') or DEFAULT_CLIENT_VERSION}")
     if not token:
         say("Not logged in. Run: py deepseek_web_api.py login")
@@ -4491,7 +4637,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
             say("Not logged in. Run: py deepseek_web_api.py login")
             return 1
         say("No saved DeepSeek login yet - starting the browser login first.\n")
-        login_args = argparse.Namespace(browser=args.browser, timeout=300.0, manual=False, token=None, keep_open=False)
+        login_args = argparse.Namespace(browser=args.browser, timeout=300.0, manual=False, token=None, no_import=False)
         code = cmd_login(login_args)
         if code != 0:
             return code
@@ -4544,7 +4690,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "examples:\n"
-            "  py deepseek_web_api.py login          sign in through a browser window\n"
+            "  py deepseek_web_api.py login          reuse your browser's DeepSeek login or sign in\n"
             "  py deepseek_web_api.py                start the API on http://127.0.0.1:20129/v1\n"
             "  py deepseek_web_api.py serve --port 8080 --api-key secret\n"
             '  py deepseek_web_api.py chat "Hello!" --think\n'
@@ -4568,12 +4714,12 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--cors", action="store_true", help="allow browser apps on other origins (Access-Control-Allow-Origin: *)")
     serve.add_argument("--max-concurrency", type=int, default=4, help="parallel upstream requests (default 4)")
 
-    login = sub.add_parser("login", parents=[common], help="sign in through a browser window and save the token")
-    login.add_argument("--browser", help="chromium, chrome, edge, brave, or the path to a browser executable")
+    login = sub.add_parser("login", parents=[common], help="reuse your browser's DeepSeek login, or sign in in a window")
+    login.add_argument("--browser", help="open this browser to sign in: chrome, edge, brave, chromium or a path")
     login.add_argument("--timeout", type=float, default=300.0, help="seconds to wait for the sign-in (default 300)")
     login.add_argument("--manual", action="store_true", help="paste a token instead of using a browser")
     login.add_argument("--token", help="save this token (or 'Copy as cURL' text) directly")
-    login.add_argument("--keep-open", action="store_true", help="leave the browser open after the token is captured")
+    login.add_argument("--no-import", action="store_true", help="don't reuse a DeepSeek login found in your browsers")
 
     logout = sub.add_parser("logout", parents=[common], help="delete the saved token")
     logout.add_argument("--all", action="store_true", help="also delete the browser profile")

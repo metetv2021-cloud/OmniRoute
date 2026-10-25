@@ -5,8 +5,8 @@ Run from the repository root (Windows: use ``py`` instead of ``python``):
     python -m unittest discover -s tests/python -v
 
 The integration tests run the real API server against a local fake of chat.deepseek.com,
-so no network or DeepSeek account is needed. The headless-browser login test is opt-in:
-set DEEPSEEK_TEST_BROWSER=1 (it needs Chromium, Chrome, Edge or Brave installed).
+so no network or DeepSeek account is needed. The browser-window login tests are opt-in:
+set DEEPSEEK_TEST_BROWSER=1 (they need Chromium, Chrome, Edge or Brave installed).
 """
 
 import base64
@@ -352,16 +352,6 @@ class PromptTests(unittest.TestCase):
         bash = f"curl 'https://chat.deepseek.com/api' -H 'authorization: Bearer {token}' -H 'user-agent: UA/1.0 (X)'"
         self.assertEqual(m.parse_pasted_login(bash), (token, {"user_agent": "UA/1.0 (X)"}))
 
-    def test_cookie_header_filters_domain_and_expiry(self):
-        cookies = [
-            {"name": "a", "value": "1", "domain": ".deepseek.com"},
-            {"name": "b", "value": "2", "domain": "chat.deepseek.com", "expires": time.time() + 100},
-            {"name": "old", "value": "3", "domain": "chat.deepseek.com", "expires": 1},
-            {"name": "x", "value": "4", "domain": "example.com"},
-            {"name": "a", "value": "5", "domain": "chat.deepseek.com"},
-        ]
-        self.assertEqual(m.cookie_header(cookies), "a=5; b=2")
-
     def test_client_locale_and_accept_language(self):
         self.assertEqual(m.client_locale("system", ["tr-TR", "tr", "en-US"]), "tr")
         self.assertEqual(m.client_locale(None, ["en-US"]), "en_US")
@@ -478,6 +468,15 @@ class ToolCallTests(unittest.TestCase):
 
 # ── end-to-end: API server <-> fake chat.deepseek.com ───────────────────────
 
+SIGN_IN_PAGE = (
+    "<!doctype html><title>Sign in</title><script>"
+    "setTimeout(function () {"
+    "localStorage.setItem('userToken', JSON.stringify({value: 'TOKEN', __version: '0'}));"
+    "localStorage.setItem('deepseek-device-id:chat', 'dev-window-1');"
+    "}, 1000);"
+    "</script>"
+)
+
 
 class FakeDeepSeek:
     """Local stand-in for the chat.deepseek.com web API. It issues real PoW challenges
@@ -531,6 +530,14 @@ class FakeDeepSeek:
 
             def do_GET(self):
                 path = self.path.split("?")[0]
+                if path == "/sign_in":  # "signs in" a second after the page opens, like a person would
+                    page = SIGN_IN_PAGE.replace("TOKEN", fake.TOKEN).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(page)))
+                    self.end_headers()
+                    self.wfile.write(page)
+                    return
                 if not self.authed():
                     return
                 if path == "/api/v0/users/current":
@@ -791,54 +798,261 @@ class ServerTests(unittest.TestCase):
             server.server_close()
 
 
-# ── optional: real headless browser login against a local page ──────────────
+# ── login: reading the token from a browser profile on disk ─────────────────
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+FIXTURE_TOKEN = "FakeT0kenForTests/0123456789abcdefABCDEFghijklmnopQRSTUVwxyz+012"
+CHROMIUM_LS_SCHEMA = """
+CREATE TABLE maps(row_id INTEGER PRIMARY KEY AUTOINCREMENT,storage_key BLOB NOT NULL,last_accessed INTEGER,last_modified INTEGER,total_size INTEGER);
+CREATE UNIQUE INDEX maps_by_storage_key ON maps(storage_key);
+CREATE TABLE map_entries(map_id INTEGER NOT NULL,value_compression_type INTEGER NOT NULL,key BLOB NOT NULL,value BLOB NOT NULL,PRIMARY KEY(map_id, key)) WITHOUT ROWID;
+CREATE TABLE meta(key LONGVARCHAR NOT NULL UNIQUE PRIMARY KEY, value LONGVARCHAR);
+"""
 
 
-@unittest.skipUnless(os.environ.get("DEEPSEEK_TEST_BROWSER"), "set DEEPSEEK_TEST_BROWSER=1 to run the headless browser test")
-class BrowserLoginTest(unittest.TestCase):
-    PAGE = (
-        "<!doctype html><title>fake</title><script>"
-        "localStorage.setItem('userToken', JSON.stringify({value: 'browser-token-1234567890', __version: '0'}));"
-        "localStorage.setItem('deepseek-device-id:chat', 'dev-xyz');"
-        "document.cookie = 'ds_session_id=abc; path=/';"
-        "</script>"
-    )
+def ls_encode(text):
+    """Chromium's localStorage string encoding: 1 + Latin-1, or 0 + UTF-16LE."""
+    try:
+        return b"\x01" + text.encode("latin-1")
+    except UnicodeEncodeError:
+        return b"\x00" + text.encode("utf-16-le")
 
-    def test_capture_token_from_page(self):
-        picked = m.pick_browser(os.environ.get("DEEPSEEK_TEST_BROWSER_PATH"))
-        if not picked:
-            self.skipTest("no Chromium-based browser installed")
-        page = self.PAGE.encode()
 
-        class Page(BaseHTTPRequestHandler):
-            def log_message(self, *args):
-                pass
+def write_sqlite_storage(profile, origins, wal=False):
+    """<profile>/LocalStorage shaped like Chromium's SQLite backend. With wal=True the
+    connection is returned still open, so the rows sit in LocalStorage-wal."""
+    import sqlite3
 
-            def do_GET(self):
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html")
-                self.send_header("Content-Length", str(len(page)))
-                self.end_headers()
-                self.wfile.write(page)
+    profile.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(profile / "LocalStorage"))
+    if wal:
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA wal_autocheckpoint=0")
+    con.executescript(CHROMIUM_LS_SCHEMA)
+    for origin, items in origins.items():
+        cur = con.execute("INSERT INTO maps(storage_key, last_accessed, last_modified, total_size) VALUES (?, 0, 0, 0)", ((origin + "/").encode(),))
+        for key, value in items.items():
+            con.execute("INSERT INTO map_entries VALUES (?, 0, ?, ?)", (cur.lastrowid, ls_encode(key), ls_encode(value)))
+    con.commit()
+    if wal:
+        return con
+    con.close()
+    return None
 
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Page)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        saved = m.DEEPSEEK_BASE
-        m.DEEPSEEK_BASE = f"http://127.0.0.1:{server.server_address[1]}"
-        profile = Path(tempfile.mkdtemp()) / "profile"
+
+def token_item(token):
+    return json.dumps({"value": token, "__version": "0"})
+
+
+class StorageReaderTests(unittest.TestCase):
+    NAMES = (m.LS_TOKEN_KEY, m.LS_DEVICE_KEY)
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_snappy(self):
+        # literal "abcd", then a 1-byte-offset copy (offset 4, length 4)
+        self.assertEqual(m.snappy_decompress(bytes([8, 3 << 2]) + b"abcd" + bytes([0b000_000_01, 4])), b"abcdabcd")
+        # literal "ab", then an overlapping 2-byte-offset copy that repeats it
+        self.assertEqual(m.snappy_decompress(bytes([8, 1 << 2]) + b"ab" + bytes([(6 - 1) << 2 | 2, 2, 0])), b"abababab")
+        # a long literal uses the 60+ length form
+        long = bytes(range(200))
+        self.assertEqual(m.snappy_decompress(bytes([200, 1]) + bytes([60 << 2, 199]) + long), long)
+        for bad in (bytes([4, 0]) + b"a" + bytes([1, 9]), bytes([9, 3 << 2]) + b"abcd"):
+            with self.assertRaises(ValueError):
+                m.snappy_decompress(bad)
+
+    def test_leveldb_log_written_by_chromium(self):
+        # Written by Chromium (LevelDB backend) for a page on http://127.0.0.1:18767.
+        folder = FIXTURES / "chromium-leveldb-log"
+        values = m._read_leveldb_storage(folder, "http://127.0.0.1:18767", self.NAMES + ("unicode",))
+        self.assertEqual(m.extract_user_token(values[m.LS_TOKEN_KEY]), FIXTURE_TOKEN)
+        self.assertEqual(values[m.LS_DEVICE_KEY], "dev-xyz-123")
+        self.assertEqual(values["unicode"], "çay ☕")  # stored as UTF-16
+        self.assertEqual(m._read_leveldb_storage(folder, "https://chat.deepseek.com", self.NAMES), {})
+
+    def test_leveldb_newest_value_wins_over_compacted_table(self):
+        # 000005.ldb (snappy blocks) holds an old token; 000004.log holds the newer one and
+        # a key that was set and then deleted.
+        folder = FIXTURES / "leveldb-compacted"
+        values = m._read_leveldb_storage(folder, "https://chat.deepseek.com", self.NAMES)
+        self.assertEqual(m.extract_user_token(values[m.LS_TOKEN_KEY]), FIXTURE_TOKEN)
+        self.assertEqual(values[m.LS_DEVICE_KEY], "dev-compacted-7")
+        self.assertEqual(m._read_leveldb_storage(folder, "https://gone.example", self.NAMES), {})
+        shutil.copyfile(str(folder / "000005.ldb"), str(self.tmp / "000005.ldb"))
+        table_only = m._read_leveldb_storage(self.tmp, "https://chat.deepseek.com", self.NAMES)
+        self.assertEqual(m.extract_user_token(table_only[m.LS_TOKEN_KEY]), "StaleTokenInCompactedTable0123456789")
+
+    def test_leveldb_torn_log_keeps_complete_records(self):
+        data = (FIXTURES / "chromium-leveldb-log" / "000003.log").read_bytes()
+        for cut in range(0, len(data), 7):
+            (self.tmp / "000003.log").write_bytes(data[:cut])
+            m._read_leveldb_storage(self.tmp, "http://127.0.0.1:18767", self.NAMES)  # must not raise
+        (self.tmp / "000003.log").write_bytes(data + b"\x00" * 5)
+        self.assertIn(m.LS_TOKEN_KEY, m._read_leveldb_storage(self.tmp, "http://127.0.0.1:18767", self.NAMES))
+
+    def test_sqlite_storage_while_the_browser_holds_it_open(self):
+        profile = self.tmp / "Default"
+        con = write_sqlite_storage(
+            profile,
+            {
+                "https://chat.deepseek.com": {m.LS_TOKEN_KEY: token_item(FIXTURE_TOKEN), m.LS_DEVICE_KEY: "dev-ünï-☕"},
+                "https://other.example": {m.LS_TOKEN_KEY: token_item("other-token-1234567890")},
+            },
+            wal=True,
+        )
         try:
-            info = m.browser_capture(picked[1], profile, headless=True, timeout=45, user_agent=m.DEFAULT_USER_AGENT)
-            self.assertEqual(info["token"], "browser-token-1234567890")
-            creds = m.creds_from_browser(info, picked[1])
-            self.assertEqual(creds["device_id"], "dev-xyz")
-            self.assertEqual(creds["token"], "browser-token-1234567890")
-            self.assertNotIn("Headless", creds["user_agent"])
+            self.assertTrue((profile / "LocalStorage-wal").is_file())
+            values = m.read_profile_storage(profile, "https://chat.deepseek.com")
         finally:
-            m.DEEPSEEK_BASE = saved
-            server.shutdown()
-            server.server_close()
-            time.sleep(1)
-            shutil.rmtree(profile.parent, ignore_errors=True)
+            con.close()
+        self.assertEqual(m.extract_user_token(values[m.LS_TOKEN_KEY]), FIXTURE_TOKEN)
+        self.assertEqual(values[m.LS_DEVICE_KEY], "dev-ünï-☕")
+        self.assertEqual(m.read_profile_storage(profile, "https://nothing.example"), {})
+        self.assertEqual(sorted(p.name for p in profile.iterdir() if p.name.startswith("LocalStorage")), ["LocalStorage"])
+
+    def test_profile_with_both_backends_prefers_sqlite(self):
+        profile = self.tmp / "Default"
+        write_sqlite_storage(profile, {"https://chat.deepseek.com": {m.LS_DEVICE_KEY: "dev-sqlite"}})
+        shutil.copytree(str(FIXTURES / "leveldb-compacted"), str(profile / "Local Storage" / "leveldb"))
+        values = m.read_profile_storage(profile, "https://chat.deepseek.com")
+        self.assertEqual(m.extract_user_token(values[m.LS_TOKEN_KEY]), FIXTURE_TOKEN)  # SQLite has none
+        self.assertEqual(values[m.LS_DEVICE_KEY], "dev-sqlite")
+
+    def test_plain_value_and_languages(self):
+        self.assertEqual(m._plain_value('{"value":"abc","__version":"0"}'), "abc")
+        self.assertEqual(m._plain_value('"dev-1"'), "dev-1")
+        self.assertIsNone(m._plain_value("  "))
+        self.assertEqual(m.client_locale(None, ["tr-TR", "tr"]), "tr")
+        self.assertEqual(m.client_locale(None, ["en-GB"]), "en_US")
+        self.assertEqual(m.accept_language_header(["tr-TR", "tr", "en"]), "tr-TR,tr;q=0.9,en;q=0.8")
+
+
+class BrowserImportTests(unittest.TestCase):
+    """`login` reusing a DeepSeek login found in an installed browser's profile."""
+
+    def setUp(self):
+        self.fake = FakeDeepSeek()
+        self.saved = (m.DEEPSEEK_BASE, m._opener, m.browser_user_data_dirs, os.environ.get("DEEPSEEK_WEB_API_HOME"))
+        m.DEEPSEEK_BASE = self.fake.base
+        m._opener = DIRECT
+        self.tmp = Path(tempfile.mkdtemp())
+        os.environ["DEEPSEEK_WEB_API_HOME"] = str(self.tmp / "home")
+        chrome = self.tmp / "Chrome" / "User Data"
+        edge = self.tmp / "Edge" / "User Data"
+        origin = self.fake.base
+        # Default holds an expired login, "Profile 2" a working one; Edge has the same working one.
+        write_sqlite_storage(chrome / "Default", {origin: {m.LS_TOKEN_KEY: token_item("expired-token-1234567890")}})
+        write_sqlite_storage(chrome / "Profile 2", {origin: {m.LS_TOKEN_KEY: token_item(FakeDeepSeek.TOKEN), m.LS_DEVICE_KEY: "dev-chrome-2"}})
+        (chrome / "Profile 2" / "Preferences").write_text(json.dumps({"intl": {"accept_languages": "tr-TR,tr,en-US,en"}}), encoding="utf-8")
+        (chrome / "Last Version").write_text("131.0.6778.86", encoding="utf-8")
+        (chrome / "Profile 3").mkdir()  # a profile without storage
+        write_sqlite_storage(edge / "Default", {origin: {m.LS_TOKEN_KEY: token_item(FakeDeepSeek.TOKEN)}})
+        self.chrome = chrome
+        m.browser_user_data_dirs = lambda: [("Google Chrome", chrome), ("Microsoft Edge", edge)]
+
+    def tearDown(self):
+        m.DEEPSEEK_BASE, m._opener, m.browser_user_data_dirs, home = self.saved
+        if home is None:
+            os.environ.pop("DEEPSEEK_WEB_API_HOME", None)
+        else:
+            os.environ["DEEPSEEK_WEB_API_HOME"] = home
+        self.fake.server.shutdown()
+        self.fake.server.server_close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def quietly(self, fn, *args):
+        import contextlib
+        import io
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            result = fn(*args)
+        return result, out.getvalue()
+
+    def test_find_and_import(self):
+        found = m.find_browser_logins()
+        self.assertEqual([(c["source"]["browser"], Path(c["source"]["profile"]).name) for c in found], [("Google Chrome", "Default"), ("Google Chrome", "Profile 2")])
+        creds, output = self.quietly(m.import_browser_login)
+        self.assertIn("Skipping the expired DeepSeek login", output)
+        self.assertEqual(creds["token"], FakeDeepSeek.TOKEN)
+        self.assertEqual(creds["device_id"], "dev-chrome-2")
+        self.assertIn("Chrome/131.0.0.0", creds["user_agent"])
+        self.assertNotIn("Edg/", creds["user_agent"])
+        self.assertEqual((creds["locale"], creds["accept_language"]), ("tr", "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7"))
+
+    def test_login_command_imports_and_saves(self):
+        args = m.build_parser().parse_args(["login"])
+        code, output = self.quietly(m.cmd_login, args)
+        self.assertEqual(code, 0, output)
+        saved = m.CredentialStore(m.credentials_path()).get()
+        self.assertEqual(saved["token"], FakeDeepSeek.TOKEN)
+        self.assertEqual(saved["source"]["type"], "browser")
+        self.assertEqual(saved["email"], "te**@example.com")
+        code, output = self.quietly(m.cmd_status, m.build_parser().parse_args(["status"]))
+        self.assertEqual(code, 0, output)
+        self.assertIn('Google Chrome (profile "Profile 2")', output)
+
+    def test_rejected_token_is_refreshed_from_the_profile(self):
+        store = m.CredentialStore(self.tmp / "credentials.json")
+        source = {"type": "browser", "browser": "Google Chrome", "profile": str(self.chrome / "Profile 2")}
+        store.save({"token": "old-token-1234567890", "device_id": "dev-chrome-2", "source": source})
+        app = m.App(store)
+        self.assertEqual(app.with_auth_retry(lambda: app.client.access_token(force=True)), FakeDeepSeek.TOKEN)
+        self.assertEqual(store.get()["token"], FakeDeepSeek.TOKEN)
+        # Nothing newer in the profile: the original error comes back, and isn't retried right away.
+        store.save({"token": "old-token-1234567890", "source": {**source, "profile": str(self.chrome / "Default")}})
+        app = m.App(store)
+        with self.assertRaises(m.AuthError):
+            app.with_auth_retry(lambda: app.client.access_token(force=True))
+        self.assertFalse(app.refresh_credentials())
+
+
+# ── optional: real browser window login against the fake site ───────────────
+
+
+@unittest.skipUnless(os.environ.get("DEEPSEEK_TEST_BROWSER"), "set DEEPSEEK_TEST_BROWSER=1 to run the browser login tests")
+class WindowLoginTest(unittest.TestCase):
+    """Opens a real (headless) Chromium-based browser on the fake sign-in page and waits for
+    the token to reach the profile on disk, with both localStorage backends."""
+
+    def setUp(self):
+        self.picked = m.pick_browser(os.environ.get("DEEPSEEK_TEST_BROWSER_PATH"))
+        if not self.picked:
+            self.skipTest("no Chromium-based browser installed")
+        self.fake = FakeDeepSeek()
+        self.saved = (m.DEEPSEEK_BASE, m._opener)
+        m.DEEPSEEK_BASE = self.fake.base
+        m._opener = DIRECT
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        m.DEEPSEEK_BASE, m._opener = self.saved
+        self.fake.server.shutdown()
+        self.fake.server.server_close()
+        time.sleep(1)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def login(self, extra_args=()):
+        profile = self.tmp / "profile"
+        creds = m.window_login(self.picked[1], profile, timeout=60, headless=True, extra_args=extra_args)
+        self.assertEqual(creds["token"], FakeDeepSeek.TOKEN)
+        self.assertEqual(creds["device_id"], "dev-window-1")
+        self.assertEqual(creds["source"]["type"], "window")
+        self.assertNotIn("Headless", creds["user_agent"])
+        return profile / "Default"
+
+    def test_window_login_sqlite_backend(self):
+        storage = self.login()
+        if not (storage / "LocalStorage").is_file():
+            self.skipTest("this browser version still uses the LevelDB backend")
+
+    def test_window_login_leveldb_backend(self):
+        storage = self.login(("--disable-features=DomStorageSqlite,DomStorageSqliteNewDatabases,DomStorageSqliteNewDatabasesStage",))
+        self.assertTrue((storage / "Local Storage" / "leveldb").is_dir())
 
 
 if __name__ == "__main__":
