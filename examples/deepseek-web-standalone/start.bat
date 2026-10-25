@@ -2,6 +2,7 @@
 rem DeepSeek Web API - Windows launcher. Double-click it: the first run reuses your
 rem browser's DeepSeek login (or opens a window to sign in), then the OpenAI-compatible API starts on
 rem http://127.0.0.1:20129/v1. Extra arguments are passed through, e.g. "start.bat login".
+rem For the desktop window, double-click gui.pyw instead.
 setlocal
 title DeepSeek Web API
 cd /d "%~dp0"

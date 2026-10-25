@@ -16,6 +16,7 @@ import json
 import os
 import random
 import shutil
+import socket
 import struct
 import sys
 import tempfile
@@ -488,6 +489,7 @@ class FakeDeepSeek:
         self.lock = threading.Lock()
         self.challenges = {}
         self.created, self.deleted, self.completions, self.continues, self.uploads = [], [], [], [], []
+        self.create_failures = []  # "http500" (a network-level failure) or "busy" (a DeepSeek error code)
         self.stream_for = lambda payload: BASIC_STREAM
         self.continue_stream = CONTINUE_STREAM
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
@@ -561,6 +563,12 @@ class FakeDeepSeek:
                         fake.challenges[challenge] = answer
                     self.ok({"challenge": {"algorithm": "DeepSeekHashV1", "challenge": challenge, "salt": salt, "signature": "sig", "difficulty": 5000, "expire_at": expire, "expire_after": 300000, "target_path": json.loads(raw)["target_path"]}})
                 elif path == "/api/v0/chat_session/create":
+                    if fake.create_failures:
+                        if fake.create_failures.pop(0) == "http500":
+                            self.send_error(500)
+                        else:
+                            self.send_json({"code": 0, "data": {"biz_code": 7, "biz_msg": "server busy"}})
+                        return
                     sid = str(uuid.uuid4())
                     fake.created.append(sid)
                     self.ok({"chat_session": {"id": sid}, "ttl_seconds": 3600})
@@ -781,6 +789,38 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(self.chat({"model": "x"})[0], 400)
         self.assertEqual(self.request("GET", "/v1/nope")[0], 404)
         self.assertEqual(self.request("GET", "/v1/models", headers={"Host": "evil.example"})[0], 403)
+
+    def test_network_hiccups_are_retried_but_deepseek_errors_are_not(self):
+        saved = m.SETUP_RETRY_DELAY
+        m.SETUP_RETRY_DELAY = 0
+        try:
+            self.fake.create_failures = ["http500", "http500"]
+            status, body = self.chat({"messages": [{"role": "user", "content": "hi"}]})
+            self.assertEqual(status, 200, body)
+            self.fake.create_failures = ["http500"] * 3
+            status, body = self.chat({"messages": [{"role": "user", "content": "hi"}]})
+            self.assertEqual(status, 500, body)
+            self.fake.create_failures = ["busy", "busy"]
+            status, body = self.chat({"messages": [{"role": "user", "content": "hi"}]})
+            self.assertEqual((status, body["error"]["code"]), (502, 7))
+            self.assertEqual(self.fake.create_failures, ["busy"])  # not retried
+        finally:
+            self.fake.create_failures = []
+            m.SETUP_RETRY_DELAY = saved
+
+    def test_request_stats(self):
+        before = dict(self.app.stats)
+        self.chat({"model": "deepseek-v4-flash", "messages": [{"role": "user", "content": "hi"}]})
+        self.chat({"model": "x"})  # rejected before it is counted (no messages)
+        self.fake.stream_for = lambda payload: TRUNCATED_STREAM
+        self.chat({"model": "broken", "messages": [{"role": "user", "content": "hi"}]})
+        for _ in range(100):  # counted right after the response goes out
+            if self.app.stats["requests"] >= before["requests"] + 2:
+                break
+            time.sleep(0.02)
+        self.assertEqual(self.app.stats["requests"], before["requests"] + 2)
+        self.assertEqual(self.app.stats["errors"], before["errors"] + 1)
+        self.assertEqual((self.app.stats["last"]["model"], self.app.stats["last"]["status"]), ("broken", 502))
 
     def test_api_key(self):
         app = m.App(self.store, auto_refresh=False, api_key="s3cret")
@@ -1009,6 +1049,244 @@ class BrowserImportTests(unittest.TestCase):
         with self.assertRaises(m.AuthError):
             app.with_auth_retry(lambda: app.client.access_token(force=True))
         self.assertFalse(app.refresh_credentials())
+
+
+# ── desktop window helpers and the window itself ────────────────────────────
+
+
+class GuiHelperTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.saved_home = os.environ.get("DEEPSEEK_WEB_API_HOME")
+        os.environ["DEEPSEEK_WEB_API_HOME"] = str(self.tmp)
+
+    def tearDown(self):
+        if self.saved_home is None:
+            os.environ.pop("DEEPSEEK_WEB_API_HOME", None)
+        else:
+            os.environ["DEEPSEEK_WEB_API_HOME"] = self.saved_home
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_settings_round_trip_and_validation(self):
+        self.assertEqual(m.load_gui_settings(), m.GUI_DEFAULTS)
+        m.gui_settings_path().write_text(json.dumps({"port": True, "api_key": 5, "lan": "yes", "cors": True, "model": "deepseek-v4-pro"}), encoding="utf-8")
+        loaded = m.load_gui_settings()
+        self.assertEqual((loaded["port"], loaded["api_key"], loaded["lan"]), (m.DEFAULT_PORT, "", False))
+        self.assertEqual((loaded["cors"], loaded["model"]), (True, "deepseek-v4-pro"))
+        m.save_gui_settings({**loaded, "port": 8080, "api_key": "k", "junk": 1})
+        self.assertEqual(m.load_gui_settings(), {**loaded, "port": 8080, "api_key": "k"})
+        m.gui_settings_path().write_text(json.dumps({"port": 70000}), encoding="utf-8")
+        self.assertEqual(m.load_gui_settings()["port"], m.DEFAULT_PORT)
+
+    def test_open_at_login_entry(self):
+        entry = self.tmp / "Startup" / "DeepSeek Web API.pyw"
+        script = Path("C:\\Users\\Ayşe Doe\\DeepSeek\\deepseek_web_api.py")
+        m.set_open_at_login(True, entry=entry, script=script)
+        source = entry.read_text(encoding="utf-8")
+        compile(source, str(entry), "exec")
+        self.assertIn(repr(str(script)), source)
+        self.assertIn('"gui", "--minimized", "--start-server"', source)
+        m.set_open_at_login(False, entry=entry)
+        self.assertFalse(entry.exists())
+        m.set_open_at_login(False, entry=entry)  # already gone
+
+    def test_connection_snippets(self):
+        snippets = m.connection_snippets("http://127.0.0.1:20129/v1", "", "deepseek-v4-flash", windows=False)
+        compile(snippets["python"], "snippet", "exec")
+        self.assertIn('api_key="anything"', snippets["python"])
+        self.assertIn("-d '{\"model\": \"deepseek-v4-flash\"", snippets["curl"])
+        windows = m.connection_snippets("http://127.0.0.1:20129/v1", "sk-1", "deepseek-v4-flash", windows=True)["curl"]
+        self.assertTrue(windows.startswith("curl.exe "))
+        self.assertIn('Bearer sk-1', windows)
+        self.assertIn('-d "{\\"model\\": \\"deepseek-v4-flash\\"', windows)
+
+    def test_describe_login_source_and_log_sinks(self):
+        self.assertEqual(m.describe_login_source({}), "-")
+        self.assertEqual(m.describe_login_source({"token": "abcdefghijklmnopqrstuvwxyz"}), "a pasted token")
+        browser = {"token": "x" * 20, "source": {"type": "browser", "browser": "Microsoft Edge", "profile": "/p/Profile 1"}}
+        self.assertEqual(m.describe_login_source(browser), 'Microsoft Edge (profile "Profile 1")')
+        lines = []
+        sink = lambda level, line: lines.append((level, line))  # noqa: E731
+        m._log_sinks.append(sink)
+        try:
+            import contextlib
+            import io
+
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                m.log("server line", "WARN")
+                m.say("user line")
+        finally:
+            m._log_sinks.remove(sink)
+        self.assertEqual(lines[0][0], "WARN")
+        self.assertTrue(lines[0][1].endswith("WARN  server line"))
+        self.assertEqual(lines[1], ("SAY", "user line"))
+
+    @unittest.skipUnless(os.name == "posix", "uses a shell script as a stand-in browser")
+    def test_window_login_can_be_cancelled(self):
+        browser = self.tmp / "fake-browser.sh"
+        browser.write_text("#!/bin/sh\nexec sleep 60\n", encoding="utf-8")
+        browser.chmod(0o755)
+        cancel = threading.Event()
+        threading.Timer(0.5, cancel.set).start()
+        started = time.monotonic()
+        with self.assertRaises(m.LoginError) as caught:
+            m.window_login(str(browser), self.tmp / "profile", timeout=60, cancel=cancel)
+        self.assertEqual(str(caught.exception), "Cancelled.")
+        self.assertLess(time.monotonic() - started, 15)
+
+
+def free_port():
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+class FakeMessageBox:
+    """Stands in for tkinter.messagebox so no dialog blocks the test."""
+
+    def __init__(self):
+        self.shown = []
+
+    def _show(self, kind, answer):
+        def show(title, message, **_):
+            self.shown.append((kind, title, message))
+            return answer
+
+        return show
+
+    def __getattr__(self, name):
+        return self._show(name, True)
+
+
+class DesktopAppTests(unittest.TestCase):
+    """Drives the real window (runs wherever Tk can open one: Windows, macOS, Linux with a display)."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import tkinter
+        except ImportError:
+            raise unittest.SkipTest("tkinter is not installed") from None
+        try:
+            cls.root = tkinter.Tk()
+        except tkinter.TclError as exc:
+            raise unittest.SkipTest(f"no display for Tk: {exc}") from None
+        cls.root.destroy()
+
+    def setUp(self):
+        import tkinter
+
+        self.fake = FakeDeepSeek()
+        self.saved = (m.DEEPSEEK_BASE, m._opener, m.browser_user_data_dirs, os.environ.get("DEEPSEEK_WEB_API_HOME"))
+        m.DEEPSEEK_BASE = self.fake.base
+        m._opener = DIRECT
+        self.tmp = Path(tempfile.mkdtemp())
+        os.environ["DEEPSEEK_WEB_API_HOME"] = str(self.tmp / "home")
+        m.browser_user_data_dirs = lambda: []
+        self.root = tkinter.Tk()
+        self.gui = m.DesktopApp(self.root)
+        self.gui.messagebox = self.box = FakeMessageBox()
+
+    def tearDown(self):
+        if not self.gui.closed:
+            self.gui.stop_server(then=self.gui._destroy)
+            self.pump(lambda: self.gui.closed, "the window to close")
+        m.DEEPSEEK_BASE, m._opener, m.browser_user_data_dirs, home = self.saved
+        if home is None:
+            os.environ.pop("DEEPSEEK_WEB_API_HOME", None)
+        else:
+            os.environ["DEEPSEEK_WEB_API_HOME"] = home
+        self.fake.server.shutdown()
+        self.fake.server.server_close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def pump(self, condition, what, timeout=20):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self.root.update()
+            if condition():
+                return
+            time.sleep(0.02)
+        self.fail(f"timed out waiting for {what}")
+
+    def chat_text(self):
+        return self.gui.chat_out.get("1.0", "end")
+
+    def test_browser_login_server_and_try_it(self):
+        gui = self.gui
+        self.pump(lambda: gui.account_var.get() == "Not signed in", "the signed-out state")
+        self.assertIn("disabled", gui.btn_signout.state())
+        chrome = self.tmp / "Chrome"
+        write_sqlite_storage(chrome / "Default", {self.fake.base: {m.LS_TOKEN_KEY: token_item(FakeDeepSeek.TOKEN)}})
+        m.browser_user_data_dirs = lambda: [("Google Chrome", chrome)]
+        gui.login_from_browser()
+        self.pump(lambda: "model types: default" in gui.account_detail_var.get(), "the browser login")
+        self.assertEqual(gui.account_var.get(), "Signed in as te**@example.com")
+        self.assertIn('Google Chrome (profile "Default")', gui.account_detail_var.get())
+        self.assertEqual(self.box.shown, [])
+
+        port = free_port()
+        gui.port_var.set(str(port))
+        gui.key_var.set("s3cret")
+        gui.start_server()
+        self.assertEqual(gui.server_var.get(), "Running")
+        self.assertEqual(gui.url_var.get(), f"http://127.0.0.1:{port}/v1")
+        self.assertIn(f'base_url="http://127.0.0.1:{port}/v1", api_key="s3cret"', gui.python_text.get("1.0", "end"))
+        url = f"http://127.0.0.1:{port}/v1/chat/completions"
+        body = json.dumps({"model": "deepseek-v4-flash", "messages": [{"role": "user", "content": "hi"}]}).encode()
+        headers = {"Content-Type": "application/json", "Authorization": "Bearer s3cret"}
+        with DIRECT.open(urllib.request.Request(url, data=body, headers=headers), timeout=30) as resp:
+            self.assertEqual(json.loads(resp.read())["choices"][0]["message"]["content"], "Hi there, friend.")
+        gui.key_var.set("changed")  # applies to the running server right away
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            DIRECT.open(urllib.request.Request(url, data=body, headers=headers), timeout=30)
+        self.assertEqual(caught.exception.code, 401)
+        self.pump(lambda: gui.stats_var.get().startswith("Requests: 2  ·  failed: 1"), "the request counter")
+
+        self.fake.stream_for = lambda payload: THINK_STREAM
+        gui.think_var.set(True)
+        gui.prompt.insert("1.0", "Is 391 prime?")
+        gui.send_chat()
+        self.pump(lambda: gui.chat_stop is None, "the test chat")
+        text = self.chat_text()
+        self.assertIn("Is 391 prime?", text)
+        self.assertIn("We need 17*23", text)
+        self.assertIn("No, 391 = 17 × 23.", text)
+        self.assertTrue(self.fake.completions[-1]["thinking_enabled"])
+        self.assertEqual([turn["role"] for turn in gui.history], ["user", "assistant"])
+
+        gui.close()  # asks first because the server is running (the fake box says yes)
+        self.pump(lambda: gui.closed, "the window to close")
+        self.assertEqual(self.box.shown[-1][1], "Quit")
+        saved = m.load_gui_settings()
+        self.assertEqual((saved["port"], saved["api_key"], saved["think"]), (port, "changed", True))
+
+    def test_paste_token_and_sign_out(self):
+        gui = self.gui
+        gui.login_paste()
+        dialog, text, save = gui.paste_dialog
+        text.insert("1.0", "not a token")
+        save()
+        self.pump(lambda: not gui.login_busy and self.box.shown, "the rejected paste")
+        self.assertEqual(self.box.shown[-1][2], "That doesn't look like a DeepSeek token.")
+        gui.login_paste()
+        dialog, text, save = gui.paste_dialog
+        text.insert("1.0", f"curl 'https://chat.deepseek.com/api/v0/users/current' -H 'authorization: Bearer {FakeDeepSeek.TOKEN}'")
+        save()
+        self.pump(lambda: "model types" in gui.account_detail_var.get(), "the pasted login")
+        self.assertEqual(gui.account_var.get(), "Signed in as te**@example.com")
+        self.assertIn("a pasted token", gui.account_detail_var.get())
+        gui.sign_out()
+        self.assertEqual(gui.account_var.get(), "Not signed in")
+        self.assertFalse(m.credentials_path().exists())
+
+    def test_failed_try_it_does_not_keep_the_turn(self):
+        gui = self.gui
+        gui.prompt.insert("1.0", "hello")
+        gui.send_chat()  # not signed in
+        self.pump(lambda: gui.chat_stop is None, "the failed chat")
+        self.assertIn("Not logged in", self.chat_text())
+        self.assertEqual(gui.history, [])
 
 
 # ── optional: real browser window login against the fake site ───────────────

@@ -4,32 +4,53 @@
 an OpenAI-compatible API on your own machine. It is a single-file Python port of OmniRoute's
 `deepseek-web` provider (`open-sse/executors/deepseek-web.ts` and its helpers): no OmniRoute, no
 Node.js, no `pip install`. To log in, it reuses the DeepSeek login you already have in Chrome, Edge
-or Brave, or opens an ordinary browser window for you to sign in.
+or Brave, or opens an ordinary browser window for you to sign in. Use it from a desktop window or
+from the command line.
 
 - `POST /v1/chat/completions`: streaming and non-streaming, DeepThink reasoning
   (`reasoning_content`), web search with a source list, tool calling, image input
 - `GET /v1/models`
+- Desktop window: sign in, start and stop the server, try the models, copy connection settings
 - Requirements: Python 3.9+ and Google Chrome, Microsoft Edge, Brave or Chromium
 
 ## Quick start (Windows)
 
-1. Install Python 3.9 or newer from [python.org](https://www.python.org/downloads/) (tick
-   **Add python.exe to PATH**).
-2. Put `deepseek_web_api.py` and `start.bat` in a folder.
+1. Install Python 3.9 or newer from [python.org](https://www.python.org/downloads/). Tick **Add
+   python.exe to PATH**, and leave **tcl/tk and IDLE** ticked (the window needs it).
+2. Put `deepseek_web_api.py`, `gui.pyw` and `start.bat` in a folder.
 3. Sign in at [chat.deepseek.com](https://chat.deepseek.com) in the browser you normally use, if
    you haven't already.
-4. Double-click `start.bat`. On the first run the script finds that login and the server starts:
+4. Double-click `gui.pyw`. In the window, click **Use my browser's login**, then **Start server**.
+   The window shows the base URL to use, `http://127.0.0.1:20129/v1`.
 
-   ```text
-   DeepSeek Web API is running
-     Base URL : http://127.0.0.1:20129/v1
-   ```
+Prefer a console? Double-click `start.bat` instead: on the first run it finds the browser login and
+starts the server. From a terminal, run `py deepseek_web_api.py gui` for the window, or
+`py deepseek_web_api.py login` and then `py deepseek_web_api.py`. On macOS and Linux use
+`python3 deepseek_web_api.py`.
 
-If no browser has a DeepSeek login, a normal browser window opens on DeepSeek's sign-in page
-instead. Sign in there; the window closes by itself a few seconds later (or close it yourself).
+If no browser has a DeepSeek login, **Open sign-in window** (or `login` in the console) opens a
+normal browser window on DeepSeek's sign-in page. Sign in there; the window closes by itself a few
+seconds later (or close it yourself).
 
-The same from a terminal: `py deepseek_web_api.py login`, then `py deepseek_web_api.py`. On macOS
-and Linux use `python3 deepseek_web_api.py`.
+## The desktop window
+
+- **DeepSeek account** shows who is signed in and where the login came from. **Use my browser's
+  login** reuses the login from Chrome, Edge, Brave and others, **Open sign-in window** lets you sign
+  in in a normal browser window, and **Paste a token…** takes a `userToken` or a "Copy as cURL".
+- **API server** starts and stops the server. You can set the port and an API key (**Generate** makes
+  one), let other devices on your network use it, allow web apps on other sites (CORS), start the
+  server when the window opens and, on Windows, open the window when you sign in to Windows. The
+  bottom line counts requests and failures, including apps that send a wrong API key.
+- **Try it** chats with any model, with DeepThink and web search switches. It talks to DeepSeek
+  directly, so it works while the server is stopped.
+- **Connect an app** has the base URL and API key with copy buttons, plus ready-made Python and curl
+  examples that follow your settings.
+- **Log** shows what the server is doing; **Detailed logging** adds debug output.
+
+The window keeps its settings in `gui-settings.json` in the data folder
+(`%LOCALAPPDATA%\DeepSeekWebAPI` on Windows). **Open at Windows sign-in** puts a small
+`DeepSeek Web API.pyw` launcher in your Startup folder that opens the window minimized with the
+server running; untick it to remove the launcher.
 
 ## Use it from any OpenAI client
 
@@ -74,6 +95,7 @@ Sampling settings such as `temperature` and `max_tokens` are ignored, because th
 | Command                                | What it does                                                                |
 | -------------------------------------- | --------------------------------------------------------------------------- |
 | `py deepseek_web_api.py`               | Same as `serve`; runs `login` first if you aren't signed in                 |
+| `gui [--minimized] [--start-server]`   | Opens the desktop window (double-clicking `gui.pyw` does the same)          |
 | `serve [--port 20129] [--api-key KEY]` | Runs the API server                                                         |
 | `login`                                | Reuses a DeepSeek login from your browsers, or opens a window to sign in    |
 | `login --no-import`                    | Skips your browsers and opens the sign-in window                            |
@@ -131,6 +153,10 @@ or `--browser "C:\path\to\browser.exe"` to choose.
    as a tool call.
 4. The answer streams back in OpenAI format and the temporary chat is deleted.
 
+If the connection to DeepSeek fails before the answer starts (a network error or a bare `5xx`), the
+request is retried up to twice. Errors DeepSeek reports itself, a rejected login and rate limits are
+passed on straight away.
+
 ## Differences from OmniRoute's TypeScript version
 
 These were found while testing against the live site and are fixed here:
@@ -165,16 +191,17 @@ way the web app does.
 
 ## Troubleshooting
 
-| Problem                                             | Fix                                                                                                   |
-| --------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| The captcha in the sign-in window is never accepted | Sign in at chat.deepseek.com in your usual browser, then run `login` again; or use `login --manual`   |
-| `login` misses the login you have in your browser   | Browsers save site data a few seconds after a change: wait a moment, or close the browser, then retry |
-| The sign-in window stays open after you signed in   | Close it yourself; the login is read when the browser closes                                          |
-| "No Chromium-based browser found"                   | Install Chrome or Edge, pass `--browser PATH`, or use `login --manual`                                |
-| `401` / "DeepSeek rejected the login token"         | Run `login` again (sign in again in the browser first if you signed out there)                        |
-| `503` "DeepSeek's firewall blocked the request"     | Wait a few minutes; if you use a VPN or proxy, try without it                                         |
-| "Could not listen on 127.0.0.1:20129"               | Another program uses the port; start with `--port 20130`                                              |
-| Behind a corporate proxy                            | The Windows proxy is used automatically; otherwise pass `--proxy URL`                                 |
+| Problem                                             | Fix                                                                                                                      |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| The captcha in the sign-in window is never accepted | Sign in at chat.deepseek.com in your usual browser, then run `login` again; or use `login --manual`                      |
+| `login` misses the login you have in your browser   | Browsers save site data a few seconds after a change: wait a moment, or close the browser, then retry                    |
+| The sign-in window stays open after you signed in   | Close it yourself; the login is read when the browser closes                                                             |
+| The window doesn't open (`gui.pyw` does nothing)    | Run `py deepseek_web_api.py gui` in a terminal to see why; reinstall Python with "tcl/tk and IDLE" if Tkinter is missing |
+| "No Chromium-based browser found"                   | Install Chrome or Edge, pass `--browser PATH`, or use `login --manual`                                                   |
+| `401` / "DeepSeek rejected the login token"         | Run `login` again (sign in again in the browser first if you signed out there)                                           |
+| `503` "DeepSeek's firewall blocked the request"     | Wait a few minutes; if you use a VPN or proxy, try without it                                                            |
+| "Could not listen on 127.0.0.1:20129"               | Another program uses the port; start with `--port 20130`                                                                 |
+| Behind a corporate proxy                            | The Windows proxy is used automatically; otherwise pass `--proxy URL`                                                    |
 
 ## Tests
 
@@ -185,5 +212,6 @@ python -m unittest discover -s tests/python -v
 ```
 
 The suite runs the real server against a local fake of chat.deepseek.com, so it needs no network
-or account. Set `DEEPSEEK_TEST_BROWSER=1` to include the sign-in window tests, which open a
-headless browser on a fake sign-in page and read the token from its profile.
+or account. The desktop window tests run wherever Tk can open a window (they skip otherwise). Set
+`DEEPSEEK_TEST_BROWSER=1` to include the sign-in window tests, which open a headless browser on a
+fake sign-in page and read the token from its profile.

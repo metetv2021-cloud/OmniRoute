@@ -4,10 +4,11 @@
 DeepSeek Web -> OpenAI-compatible API, as one standalone Python script.
 
 A port of OmniRoute's ``deepseek-web`` provider (open-sse/executors/deepseek-web.ts
-and the helpers it uses). `login` reuses the chat.deepseek.com login you already have
-in Google Chrome, Microsoft Edge, Brave or another Chromium-based browser, or opens a
-normal browser window for you to sign in; the script then serves an OpenAI-compatible
-API backed by your DeepSeek web account:
+and the helpers it uses). It reuses the chat.deepseek.com login you already have in
+Google Chrome, Microsoft Edge, Brave or another Chromium-based browser, or opens a
+normal browser window for you to sign in, then serves an OpenAI-compatible API backed
+by your DeepSeek web account. Use it from the command line or from its desktop window
+(`gui`):
 
     POST /v1/chat/completions   streaming and non-streaming, reasoning
                                 ("reasoning_content"), web search with sources,
@@ -18,6 +19,7 @@ Requirements: Python 3.9+ and a Chromium-based browser. No pip packages.
 
 Windows quick start (cmd or PowerShell, in this folder):
 
+    py deepseek_web_api.py gui       <- the desktop window (or double-click gui.pyw)
     py deepseek_web_api.py login     <- reuses your browser's DeepSeek login, or opens a window
     py deepseek_web_api.py           <- serves http://127.0.0.1:20129/v1
 
@@ -38,6 +40,7 @@ import http.client
 import ipaddress
 import json
 import os
+import queue
 import re
 import secrets
 import shutil
@@ -87,6 +90,8 @@ APP_NAME = "DeepSeekWebAPI"
 ACCESS_TOKEN_TTL = 3600  # seconds, same as OmniRoute
 AUTH_ERROR_CODES = {40001, 40002, 40003}
 MAX_CONTINUES = 4  # automatic "continue" rounds when DeepSeek stops a long answer early
+SETUP_RETRIES = 2  # retries for network hiccups before an answer starts
+SETUP_RETRY_DELAY = 1.0  # seconds, doubled per retry
 DEFAULT_AUTO_HISTORY_WINDOW = 20  # OmniRoute #10527
 MAX_REQUEST_BYTES = 100 * 1024 * 1024
 
@@ -115,16 +120,27 @@ MODEL_IDS = [
 
 _log_lock = threading.Lock()
 _verbose = False
+# Extra receivers of log() / say() lines as (level, line); the desktop window adds one.
+_log_sinks: List[Callable[[str, str], None]] = []
+
+
+def _to_sinks(level: str, line: str) -> None:
+    for sink in list(_log_sinks):
+        try:
+            sink(level, line)
+        except Exception:  # noqa: BLE001 - a broken receiver must not break logging
+            pass
 
 
 def log(message: str, level: str = "INFO") -> None:
-    stamp = time.strftime("%H:%M:%S")
+    line = f"[{time.strftime('%H:%M:%S')}] {level:<5} {message}"
     with _log_lock:
         try:
-            sys.stderr.write(f"[{stamp}] {level:<5} {message}\n")
+            sys.stderr.write(line + "\n")
             sys.stderr.flush()
-        except (OSError, ValueError, AttributeError):
+        except (OSError, ValueError, AttributeError):  # no console (pythonw)
             pass
+    _to_sinks(level, line)
 
 
 def debug(message: str) -> None:
@@ -138,6 +154,7 @@ def say(message: str = "") -> None:
         print(message, flush=True)
     except (OSError, ValueError, AttributeError):
         pass
+    _to_sinks("SAY", message)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -2979,6 +2996,24 @@ INCOMPLETE_STREAM_MESSAGE = (
 )
 
 
+def _is_transient(exc: UpstreamError) -> bool:
+    """Network errors and bare 5xx answers; DeepSeek's own error codes are not retried."""
+    return type(exc) in (UpstreamError, PowError) and exc.status >= 500 and exc.code is None
+
+
+def retry_transient(fn: Callable[[], Any], retries: Optional[int] = None) -> Any:
+    retries = SETUP_RETRIES if retries is None else retries
+    for attempt in range(retries + 1):
+        try:
+            return fn()
+        except UpstreamError as exc:
+            if attempt >= retries or not _is_transient(exc):
+                raise
+            log(f"{exc} - retrying ({attempt + 1}/{retries})", "WARN")
+            time.sleep(SETUP_RETRY_DELAY * (2**attempt))
+    raise AssertionError("unreachable")
+
+
 class ChatJob:
     """Runs one /v1/chat/completions request against chat.deepseek.com.
 
@@ -3154,7 +3189,7 @@ class ChatJob:
             sid, resp = self._open(access, self.prompt)
             return access, sid, resp
 
-        access, sid, resp = self.app.with_auth_retry(start)
+        access, sid, resp = self.app.with_auth_retry(lambda: retry_transient(start))
         sessions = [sid]
         try:
             yield "start", None
@@ -3254,6 +3289,15 @@ class App:
         self._refresh_ok_at = -1e9
         self._refresh_failed_at = -1e9
         self._fallbacks_noted: set = set()
+        self._stats_lock = threading.Lock()
+        self.stats: Dict[str, Any] = {"requests": 0, "errors": 0, "last": None}
+
+    def record_request(self, model: str, status: int, seconds: float) -> None:
+        with self._stats_lock:
+            self.stats["requests"] += 1
+            if status >= 400:
+                self.stats["errors"] += 1
+            self.stats["last"] = {"model": model, "status": status, "seconds": round(seconds, 1), "at": time.time()}
 
     def note_fallback(self, model_type: str) -> None:
         if model_type not in self._fallbacks_noted:
@@ -3423,6 +3467,8 @@ class ApiHandler(BaseHTTPRequestHandler):
     def _guard(self) -> bool:
         app = self.app
         if app.check_host and not _is_local_host_header(self.headers.get("Host") or ""):
+            log(f"Blocked a request for host {self.headers.get('Host')!r} (only localhost is allowed)", "WARN")
+            app.record_request("(blocked host)", 403, 0.0)
             self._send_error(
                 403,
                 "Use http://127.0.0.1 or http://localhost to reach this server (DNS-rebinding protection)",
@@ -3434,6 +3480,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             auth = self.headers.get("Authorization") or ""
             supplied = auth[7:].strip() if auth[:7].lower() == "bearer " else (self.headers.get("x-api-key") or "").strip()
             if not hmac.compare_digest(supplied.encode("utf-8"), app.api_key.encode("utf-8")):
+                log(f"Rejected a request from {self.client_address[0]}: wrong or missing API key", "WARN")
+                app.record_request("(wrong API key)", 401, 0.0)
                 self._send_error(401, "Invalid or missing API key", "authentication_error", close=True)
                 return False
         return True
@@ -3540,7 +3588,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             status = 499
         finally:
             self.app.slots.release()
-            log(f"POST {path} model={job.model} stream={job.stream} -> {status} ({time.monotonic() - started:.1f}s)")
+            elapsed = time.monotonic() - started
+            self.app.record_request(job.model, status, elapsed)
+            log(f"POST {path} model={job.model} stream={job.stream} -> {status} ({elapsed:.1f}s)")
 
     def _complete(self, job: ChatJob) -> int:
         content: List[str] = []
@@ -4293,7 +4343,13 @@ def close_browser(proc: subprocess.Popen, timeout: float = 10.0, force: bool = F
         return True
     try:
         if os.name == "nt":  # taskkill without /F sends the windows a normal close request
-            subprocess.run(["taskkill", "/PID", str(proc.pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),  # no console flash from the window app
+            )
         else:
             proc.terminate()  # SIGTERM: Chromium shuts down cleanly
         proc.wait(timeout=timeout)
@@ -4312,9 +4368,10 @@ def window_login(
     *,
     headless: bool = False,
     extra_args: Tuple[str, ...] = (),
+    cancel: Optional[threading.Event] = None,
 ) -> Dict[str, Any]:
     """Open DeepSeek's sign-in page in a normal browser window and wait for the token
-    to land in the profile's localStorage files."""
+    to land in the profile's localStorage files. Setting `cancel` stops the wait."""
     profile.mkdir(parents=True, exist_ok=True)
     storage = profile / "Default"
     checked: set = set()
@@ -4345,7 +4402,10 @@ def window_login(
     creds = None
     try:
         while True:
-            time.sleep(2)
+            if cancel is not None and cancel.wait(2):
+                raise LoginError("Cancelled.")
+            if cancel is None:
+                time.sleep(2)
             creds = captured()
             if creds:
                 return creds
@@ -4373,6 +4433,15 @@ def _browser_name(exe: str) -> str:
     return "Google Chrome" if "chrome" in lowered else "Chromium"
 
 
+def describe_login_source(creds: Dict[str, Any]) -> str:
+    source = creds.get("source") if isinstance(creds.get("source"), dict) else {}
+    if source.get("type") == "browser":
+        return f"{source.get('browser')} (profile \"{Path(str(source.get('profile'))).name}\")"
+    if source.get("type") == "window":
+        return "the sign-in window"
+    return "a pasted token" if extract_user_token(creds.get("token")) else "-"
+
+
 def refresh_from_browser_profile(store: CredentialStore) -> bool:
     """After DeepSeek rejects the saved token, pick up a newer one from the profile it came from."""
     if store.env_token:
@@ -4391,6 +4460,1061 @@ def refresh_from_browser_profile(store: CredentialStore) -> bool:
     store.update(token=token, saved_at=int(time.time()))
     log("Picked up a newer DeepSeek login from the browser profile.")
     return True
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Desktop window: the `gui` command
+#
+# Tkinter comes with the python.org installer for Windows, so the window needs no
+# extra packages either. Tk is single-threaded: logins, checks, chats and the server
+# run on worker threads and hand their results back through DesktopApp.call().
+# ════════════════════════════════════════════════════════════════════════════
+
+GUI_DEFAULTS: Dict[str, Any] = {
+    "port": DEFAULT_PORT,
+    "api_key": "",
+    "lan": False,
+    "cors": False,
+    "autostart": False,
+    "model": "deepseek-v4-flash",
+    "think": False,
+    "search": False,
+}
+GUI_COLORS = {"ok": "#1a7f37", "bad": "#cf222e", "warn": "#9a6700", "muted": "#6e7781", "accent": "#4d6bfe"}
+
+
+def gui_settings_path() -> Path:
+    return app_dir() / "gui-settings.json"
+
+
+def load_gui_settings() -> Dict[str, Any]:
+    settings = dict(GUI_DEFAULTS)
+    try:
+        data = json.loads(gui_settings_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return settings
+    if isinstance(data, dict):
+        for key, default in GUI_DEFAULTS.items():
+            if type(data.get(key)) is type(default):  # `type is`: True must not pass as a port
+                settings[key] = data[key]
+    if not 1 <= settings["port"] <= 65535:
+        settings["port"] = DEFAULT_PORT
+    return settings
+
+
+def save_gui_settings(settings: Dict[str, Any]) -> None:
+    path = gui_settings_path()
+    data = {key: settings.get(key, default) for key, default in GUI_DEFAULTS.items()}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)  # holds the API key
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+        os.replace(str(tmp), str(path))
+    except OSError as exc:
+        log(f"Could not save the window settings: {exc}", "WARN")
+
+
+def startup_entry_path() -> Optional[Path]:
+    """Where "Open at Windows sign-in" puts its launcher (the per-user Startup folder)."""
+    appdata = os.environ.get("APPDATA")
+    if os.name != "nt" or not appdata:
+        return None
+    return Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / "DeepSeek Web API.pyw"
+
+
+def set_open_at_login(enabled: bool, entry: Optional[Path] = None, script: Optional[Path] = None) -> None:
+    entry = entry or startup_entry_path()
+    if entry is None:
+        raise OSError("Opening at sign-in is only available on Windows")
+    if not enabled:
+        try:
+            entry.unlink()
+        except FileNotFoundError:
+            pass
+        return
+    script = script or Path(os.path.abspath(__file__))
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    entry.write_text(
+        "# Opens the DeepSeek Web API window when you sign in to Windows (.pyw files run without\n"
+        '# a console). Created by deepseek_web_api.py: untick "Open at Windows sign-in" there,\n'
+        "# or delete this file, to stop it.\n"
+        "import runpy\n"
+        "import sys\n\n"
+        f'sys.argv = [{str(script)!r}, "gui", "--minimized", "--start-server"]\n'
+        'runpy.run_path(sys.argv[0], run_name="__main__")\n',
+        encoding="utf-8",
+    )
+
+
+def connection_snippets(base_url: str, api_key: str, model: str, windows: Optional[bool] = None) -> Dict[str, str]:
+    """Copy-paste examples for the "Connect an app" tab."""
+    windows = os.name == "nt" if windows is None else windows
+    key = api_key or "anything"
+    python = (
+        "from openai import OpenAI\n\n"
+        f'client = OpenAI(base_url="{base_url}", api_key="{key}")\n'
+        "reply = client.chat.completions.create(\n"
+        f'    model="{model}",\n'
+        '    messages=[{"role": "user", "content": "Hello!"}],\n'
+        ")\n"
+        "print(reply.choices[0].message.content)"
+    )
+    body = json.dumps({"model": model, "messages": [{"role": "user", "content": "Hello!"}]})
+    if windows:  # Command Prompt quoting; curl.exe ships with Windows 10 and 11
+        escaped = body.replace('"', '\\"')
+        curl = (
+            f'curl.exe {base_url}/chat/completions -H "Content-Type: application/json" '
+            f'-H "Authorization: Bearer {key}" -d "{escaped}"'
+        )
+    else:
+        curl = (
+            f"curl {base_url}/chat/completions -H 'Content-Type: application/json' "
+            f"-H 'Authorization: Bearer {key}' -d '{body}'"
+        )
+    return {"python": python, "curl": curl}
+
+
+def lan_address() -> Optional[str]:
+    """This computer's address on the local network (no packets are sent)."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("192.0.2.1", 9))  # TEST-NET-1: only picks the outgoing interface
+            address = probe.getsockname()[0]
+    except OSError:
+        return None
+    return None if address.startswith("127.") or address == "0.0.0.0" else address
+
+
+def _icon_image(tk: Any, root: Any) -> Any:
+    """A small round window icon drawn in code, so the script stays a single file."""
+    size = 32
+    image = tk.PhotoImage(master=root, width=size, height=size)
+    rows, outside = [], []
+    for y in range(size):
+        row = []
+        for x in range(size):
+            distance = ((x - 15.5) ** 2 + (y - 15.5) ** 2) ** 0.5
+            if distance > 15.5:
+                row.append("#ffffff")
+                outside.append((x, y))
+            elif 6.0 <= distance <= 9.5:
+                row.append("#ffffff")
+            else:
+                row.append(GUI_COLORS["accent"])
+        rows.append("{" + " ".join(row) + "}")
+    image.put(" ".join(rows))
+    for x, y in outside:
+        root.tk.call(str(image), "transparency", "set", x, y, 1)
+    return image
+
+
+class DesktopApp:
+    """Sign in, run the API server and try it out, in one window."""
+
+    def __init__(self, root: Any, start_server: bool = False):
+        import tkinter as tk
+        from tkinter import font as tkfont
+        from tkinter import messagebox, scrolledtext, ttk
+
+        self.tk, self.ttk, self.tkfont = tk, ttk, tkfont
+        self.messagebox, self.scrolledtext = messagebox, scrolledtext
+        self.root = root
+        self.settings = load_gui_settings()
+        self.store = CredentialStore(credentials_path(), env_token=os.environ.get("DEEPSEEK_USER_TOKEN"))
+        self.chat_app = App(self.store)
+        self.server: Optional[ApiServer] = None
+        self.server_app: Optional[App] = None
+        self.stopping = False
+        self.login_busy = False
+        self.login_cancel: Optional[threading.Event] = None
+        self.chat_stop: Optional[threading.Event] = None
+        self.history: List[Dict[str, str]] = []
+        self.closed = False
+        self._save_job: Optional[str] = None
+        self._jobs: Dict[str, str] = {}  # pending Tk "after" callbacks, cancelled on close
+        self._calls: "queue.Queue[Callable[[], None]]" = queue.Queue()
+        self._sink = lambda level, line: self._calls.put(lambda: self._append_log(level, line))
+        _log_sinks.append(self._sink)
+        self._build()
+        root.protocol("WM_DELETE_WINDOW", self.close)
+        root.report_callback_exception = self._callback_error
+        self._jobs["pump"] = root.after(50, self._pump)
+        self._jobs["tick"] = root.after(1000, self._tick)
+        self._server_state()
+        self.refresh_account(check=True)
+        if start_server or self.settings["autostart"]:
+            root.after(200, self.start_server)
+
+    # ── plumbing ────────────────────────────────────────────────────────────
+
+    def call(self, fn: Callable[..., Any], *args: Any) -> None:
+        """Run fn(*args) on the Tk thread (safe from any thread)."""
+        self._calls.put(lambda: fn(*args))
+
+    def _pump(self) -> None:
+        if self.closed:
+            return
+        for _ in range(500):
+            try:
+                fn = self._calls.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn()
+            except Exception as exc:  # noqa: BLE001 - keep the window alive
+                debug(traceback.format_exc())
+                self._append_log("ERROR", f"Window update failed: {exc!r}")
+            if self.closed:
+                return
+        self._jobs["pump"] = self.root.after(50, self._pump)
+
+    def _callback_error(self, exc_type: Any, exc: BaseException, tb: Any) -> None:
+        log(f"Unexpected error in the window: {exc!r}", "ERROR")
+        debug("".join(traceback.format_exception(exc_type, exc, tb)))
+        self.messagebox.showerror("DeepSeek Web API", f"Unexpected error: {exc}", parent=self.root)
+
+    def _dot(self, parent: Any) -> Any:
+        """A round status light (drawn, so it doesn't depend on the font having a ● glyph)."""
+        size = max(10, round(12 * self.root.winfo_fpixels("1i") / 96))
+        background = self.ttk.Style(self.root).lookup("TFrame", "background") or self.root.cget("background")
+        canvas = self.tk.Canvas(parent, width=size, height=size, highlightthickness=0, borderwidth=0, background=background)
+        canvas.create_oval(1, 1, size - 1, size - 1, fill=GUI_COLORS["muted"], outline="", tags="dot")
+        return canvas
+
+    def _paint(self, dot: Any, color: str) -> None:
+        dot.itemconfigure("dot", fill=GUI_COLORS[color])
+
+    def _on(self, widget: Any, enabled: bool) -> None:
+        widget.state(["!disabled"] if enabled else ["disabled"])
+
+    def _copy(self, text: str, button: Any = None) -> None:
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        if button is not None:
+            label = button.cget("text")
+            button.configure(text="Copied")
+            self.root.after(1200, lambda: button.configure(text=label))
+
+    # ── layout ──────────────────────────────────────────────────────────────
+
+    def _build(self) -> None:
+        tk, ttk = self.tk, self.ttk
+        root = self.root
+        root.title("DeepSeek Web API")
+        self.scale = max(1.0, root.winfo_fpixels("1i") / 96)  # pixel sizes below are for 100 % display scaling
+        root.minsize(round(720 * self.scale), round(640 * self.scale))
+        try:
+            self._icon = _icon_image(tk, root)
+            root.iconphoto(True, self._icon)
+        except tk.TclError:
+            pass
+        style = ttk.Style(root)
+        if os.name != "nt" and sys.platform != "darwin" and "clam" in style.theme_names():
+            style.theme_use("clam")
+        base = self.tkfont.nametofont("TkDefaultFont")
+        self.font_bold = base.copy()
+        self.font_bold.configure(weight="bold")
+        text_font = self.tkfont.nametofont("TkTextFont")
+        self.font_italic = text_font.copy()
+        self.font_italic.configure(slant="italic")
+        self.font_text_bold = text_font.copy()
+        self.font_text_bold.configure(weight="bold")
+        style.configure("Status.TLabel", font=self.font_bold)
+        style.configure("Muted.TLabel", foreground=GUI_COLORS["muted"])
+
+        outer = ttk.Frame(root, padding=12)
+        outer.pack(fill="both", expand=True)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(2, weight=1)
+        self._build_account(outer).grid(row=0, column=0, sticky="ew")
+        self._build_server(outer).grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        notebook = ttk.Notebook(outer)
+        notebook.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
+        notebook.add(self._build_chat(notebook), text="  Try it  ")
+        notebook.add(self._build_connect(notebook), text="  Connect an app  ")
+        notebook.add(self._build_log(notebook), text="  Log  ")
+        self.notebook = notebook
+        self.stats_var = tk.StringVar()
+        ttk.Label(outer, textvariable=self.stats_var, style="Muted.TLabel").grid(row=3, column=0, sticky="w", pady=(6, 0))
+
+    def _build_account(self, parent: Any) -> Any:
+        tk, ttk = self.tk, self.ttk
+        frame = ttk.LabelFrame(parent, text=" DeepSeek account ", padding=(12, 6, 12, 10))
+        frame.columnconfigure(1, weight=1)
+        self.account_dot = self._dot(frame)
+        self.account_dot.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.account_var = tk.StringVar(value="Checking the saved login…")
+        ttk.Label(frame, textvariable=self.account_var, style="Status.TLabel").grid(row=0, column=1, sticky="w")
+        self.account_detail_var = tk.StringVar()
+        self.account_detail = ttk.Label(
+            frame, textvariable=self.account_detail_var, style="Muted.TLabel", wraplength=round(660 * self.scale), justify="left"
+        )
+        self.account_detail.grid(row=1, column=1, sticky="w", pady=(2, 8))
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=2, column=0, columnspan=2, sticky="w")
+        self.btn_import = ttk.Button(buttons, text="Use my browser's login", command=self.login_from_browser)
+        self.btn_window = ttk.Button(buttons, text="Open sign-in window", command=self.login_in_window)
+        self.btn_paste = ttk.Button(buttons, text="Paste a token…", command=self.login_paste)
+        self.btn_signout = ttk.Button(buttons, text="Sign out", command=self.sign_out)
+        self.btn_cancel = ttk.Button(buttons, text="Cancel", command=self.cancel_login)
+        for column, button in enumerate((self.btn_import, self.btn_window, self.btn_paste, self.btn_signout, self.btn_cancel)):
+            button.grid(row=0, column=column, padx=(0, 6))
+        self.btn_cancel.grid_remove()
+        return frame
+
+    def _build_server(self, parent: Any) -> Any:
+        tk, ttk = self.tk, self.ttk
+        frame = ttk.LabelFrame(parent, text=" API server ", padding=(12, 6, 12, 10))
+        row = ttk.Frame(frame)
+        row.pack(fill="x")
+        ttk.Label(row, text="Port").pack(side="left")
+        self.port_var = tk.StringVar(value=str(self.settings["port"]))
+        self.port_entry = ttk.Spinbox(row, from_=1, to=65535, textvariable=self.port_var, width=7)
+        self.port_entry.pack(side="left", padx=(6, 18))
+        ttk.Label(row, text="API key").pack(side="left")
+        self.key_var = tk.StringVar(value=self.settings["api_key"])
+        ttk.Entry(row, textvariable=self.key_var).pack(side="left", fill="x", expand=True, padx=6)
+        ttk.Button(row, text="Generate", command=self.generate_key).pack(side="left")
+        ttk.Label(
+            frame, text="Apps must send this as their API key. Leave it empty to accept any key.", style="Muted.TLabel"
+        ).pack(anchor="w", pady=(4, 6))
+        options = ttk.Frame(frame)
+        options.pack(fill="x")
+        self.lan_var = tk.BooleanVar(value=self.settings["lan"])
+        self.cors_var = tk.BooleanVar(value=self.settings["cors"])
+        self.autostart_var = tk.BooleanVar(value=self.settings["autostart"])
+        entry = startup_entry_path()
+        self.at_login_var = tk.BooleanVar(value=bool(entry and entry.exists()))
+        self.lan_check = ttk.Checkbutton(
+            options, text="Allow other devices on my network", variable=self.lan_var, command=self._settings_changed
+        )
+        self.lan_check.grid(row=0, column=0, sticky="w", padx=(0, 28))
+        ttk.Checkbutton(
+            options, text="Allow web apps on other sites (CORS)", variable=self.cors_var, command=self._settings_changed
+        ).grid(row=0, column=1, sticky="w")
+        ttk.Checkbutton(
+            options, text="Start the server when this window opens", variable=self.autostart_var, command=self._settings_changed
+        ).grid(row=1, column=0, sticky="w", padx=(0, 28), pady=(2, 0))
+        if entry is not None:
+            ttk.Checkbutton(
+                options, text="Open at Windows sign-in", variable=self.at_login_var, command=self._toggle_open_at_login
+            ).grid(row=1, column=1, sticky="w", pady=(2, 0))
+        ttk.Separator(frame).pack(fill="x", pady=8)
+        control = ttk.Frame(frame)
+        control.pack(fill="x")
+        self.server_btn = ttk.Button(control, text="Start server", command=self.toggle_server, width=14)
+        self.server_btn.pack(side="left")
+        self.server_dot = self._dot(control)
+        self.server_dot.pack(side="left", padx=(14, 6))
+        self.server_var = tk.StringVar(value="Stopped")
+        ttk.Label(control, textvariable=self.server_var).pack(side="left")
+        self.copy_url_btn = ttk.Button(control, text="Copy URL", command=lambda: self._copy(self.base_url(), self.copy_url_btn))
+        self.copy_url_btn.pack(side="right")
+        self.url_var = tk.StringVar()
+        ttk.Entry(control, textvariable=self.url_var, state="readonly", width=32).pack(side="right", padx=6)
+        self.key_var.trace_add("write", lambda *_: self._settings_changed())
+        self.port_var.trace_add("write", lambda *_: self._settings_changed())
+        return frame
+
+    def _build_chat(self, parent: Any) -> Any:
+        tk, ttk = self.tk, self.ttk
+        frame = ttk.Frame(parent, padding=10)
+        top = ttk.Frame(frame)
+        top.pack(fill="x")
+        ttk.Label(top, text="Model").pack(side="left")
+        self.model_var = tk.StringVar(value=self.settings["model"])
+        ttk.Combobox(top, textvariable=self.model_var, values=MODEL_IDS, width=30).pack(side="left", padx=(6, 12))
+        self.think_var = tk.BooleanVar(value=self.settings["think"])
+        self.search_var = tk.BooleanVar(value=self.settings["search"])
+        ttk.Checkbutton(top, text="DeepThink", variable=self.think_var).pack(side="left")
+        ttk.Checkbutton(top, text="Web search", variable=self.search_var).pack(side="left", padx=(8, 0))
+        ttk.Button(top, text="New chat", command=self.new_chat).pack(side="right")
+        self.chat_out = self.scrolledtext.ScrolledText(
+            frame, wrap="word", height=8, state="disabled", relief="solid", borderwidth=1, padx=8, pady=6
+        )
+        self.chat_out.pack(fill="both", expand=True, pady=8)
+        self.chat_out.tag_configure("who", font=self.font_text_bold, spacing1=4)
+        self.chat_out.tag_configure("reasoning", foreground=GUI_COLORS["muted"], font=self.font_italic)
+        self.chat_out.tag_configure("meta", foreground=GUI_COLORS["muted"])
+        self.chat_out.tag_configure("error", foreground=GUI_COLORS["bad"])
+        bottom = ttk.Frame(frame)
+        bottom.pack(fill="x")
+        self.prompt = tk.Text(bottom, height=3, wrap="word", relief="solid", borderwidth=1, padx=6, pady=4)
+        self.prompt.pack(side="left", fill="x", expand=True)
+        side = ttk.Frame(bottom)
+        side.pack(side="left", fill="y", padx=(8, 0))
+        self.send_btn = ttk.Button(side, text="Send", command=self.send_chat)
+        self.send_btn.pack(fill="x")
+        self.stop_btn = ttk.Button(side, text="Stop", command=self.stop_chat)
+        self.stop_btn.pack(fill="x", pady=(4, 0))
+        self._on(self.stop_btn, False)
+
+        def on_return(event: Any) -> Optional[str]:
+            if event.state & 0x0001:  # Shift+Enter: new line
+                return None
+            self.send_chat()
+            return "break"
+
+        self.prompt.bind("<Return>", on_return)
+        ttk.Label(
+            frame,
+            text="Enter sends, Shift+Enter starts a new line. This talks to DeepSeek directly, so it works with the server stopped.",
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(4, 0))
+        return frame
+
+    def _readonly_text(self, parent: Any, height: int) -> Any:
+        text = self.tk.Text(parent, height=height, wrap="none", relief="solid", borderwidth=1, padx=6, pady=4)
+        text.configure(font=self.tkfont.nametofont("TkFixedFont"), state="disabled")
+        return text
+
+    def _build_connect(self, parent: Any) -> Any:
+        ttk = self.ttk
+        frame = ttk.Frame(parent, padding=10)
+        frame.columnconfigure(1, weight=1)
+        ttk.Label(
+            frame,
+            text="Point any OpenAI-compatible app at this server. Model names are listed in the Try it tab.",
+            wraplength=round(660 * self.scale),
+            justify="left",
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        self.connect_url_var = self.tk.StringVar()
+        self.connect_key_var = self.tk.StringVar()
+        ttk.Label(frame, text="Base URL").grid(row=1, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=self.connect_url_var, state="readonly").grid(row=1, column=1, sticky="ew", padx=6)
+        copy_url = ttk.Button(frame, text="Copy", command=lambda: self._copy(self.connect_url_var.get(), copy_url))
+        copy_url.grid(row=1, column=2)
+        ttk.Label(frame, text="API key").grid(row=2, column=0, sticky="w", pady=(4, 0))
+        ttk.Entry(frame, textvariable=self.connect_key_var, state="readonly").grid(row=2, column=1, sticky="ew", padx=6, pady=(4, 0))
+        copy_key = ttk.Button(frame, text="Copy", command=lambda: self._copy(self.key_var.get().strip() or "anything", copy_key))
+        copy_key.grid(row=2, column=2, pady=(4, 0))
+        ttk.Label(frame, text="Python (pip install openai)").grid(row=3, column=0, columnspan=2, sticky="w", pady=(12, 2))
+        self.python_text = self._readonly_text(frame, 8)
+        self.python_text.grid(row=4, column=0, columnspan=2, sticky="nsew")
+        copy_py = ttk.Button(frame, text="Copy", command=lambda: self._copy(self._snippets()["python"], copy_py))
+        copy_py.grid(row=4, column=2, sticky="n", padx=(6, 0))
+        shell = "curl (Command Prompt)" if os.name == "nt" else "curl"
+        ttk.Label(frame, text=shell).grid(row=5, column=0, columnspan=2, sticky="w", pady=(12, 2))
+        self.curl_text = self._readonly_text(frame, 3)
+        self.curl_text.configure(wrap="char")
+        self.curl_text.grid(row=6, column=0, columnspan=2, sticky="nsew")
+        copy_curl = ttk.Button(frame, text="Copy", command=lambda: self._copy(self._snippets()["curl"], copy_curl))
+        copy_curl.grid(row=6, column=2, sticky="n", padx=(6, 0))
+        frame.rowconfigure(4, weight=1)
+        return frame
+
+    def _build_log(self, parent: Any) -> Any:
+        tk, ttk = self.tk, self.ttk
+        frame = ttk.Frame(parent, padding=10)
+        self.log_out = self.scrolledtext.ScrolledText(frame, wrap="word", height=8, state="disabled", relief="solid", borderwidth=1)
+        self.log_out.configure(font=self.tkfont.nametofont("TkFixedFont"))
+        self.log_out.pack(fill="both", expand=True)
+        self.log_out.tag_configure("WARN", foreground=GUI_COLORS["warn"])
+        self.log_out.tag_configure("ERROR", foreground=GUI_COLORS["bad"])
+        self.log_out.tag_configure("DEBUG", foreground=GUI_COLORS["muted"])
+        row = ttk.Frame(frame)
+        row.pack(fill="x", pady=(8, 0))
+        ttk.Button(row, text="Clear", command=self._clear_log).pack(side="left")
+        self.verbose_var = tk.BooleanVar(value=_verbose)
+        ttk.Checkbutton(row, text="Detailed logging", variable=self.verbose_var, command=self._toggle_verbose).pack(
+            side="left", padx=12
+        )
+        ttk.Button(row, text="Open data folder", command=self.open_data_folder).pack(side="right")
+        return frame
+
+    # ── small helpers ───────────────────────────────────────────────────────
+
+    def _append_log(self, level: str, line: str) -> None:
+        if self.closed or (level == "SAY" and not line.strip()):
+            return
+        if level == "SAY":
+            line = f"[{time.strftime('%H:%M:%S')}]       {line}"
+        widget = self.log_out
+        widget.configure(state="normal")
+        widget.insert("end", line + "\n", level)
+        if int(widget.index("end-1c").split(".")[0]) > 3000:
+            widget.delete("1.0", "500.0")
+        widget.see("end")
+        widget.configure(state="disabled")
+
+    def _clear_log(self) -> None:
+        self.log_out.configure(state="normal")
+        self.log_out.delete("1.0", "end")
+        self.log_out.configure(state="disabled")
+
+    def _toggle_verbose(self) -> None:
+        global _verbose
+        _verbose = bool(self.verbose_var.get())
+
+    def _set_text(self, widget: Any, text: str) -> None:
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        widget.insert("1.0", text)
+        widget.configure(state="disabled")
+
+    def _port(self) -> Optional[int]:
+        try:
+            port = int(self.port_var.get().strip())
+        except ValueError:
+            return None
+        return port if 1 <= port <= 65535 else None
+
+    def base_url(self) -> str:
+        port = self.server.server_address[1] if self.server else (self._port() or DEFAULT_PORT)
+        return f"http://127.0.0.1:{port}/v1"
+
+    def _snippets(self) -> Dict[str, str]:
+        model = self.model_var.get().strip() or "deepseek-v4-flash"
+        return connection_snippets(self.base_url(), self.key_var.get().strip(), model)
+
+    def _update_connect(self) -> None:
+        self.connect_url_var.set(self.base_url())
+        self.connect_key_var.set(self.key_var.get().strip() or "anything (no key required)")
+        snippets = self._snippets()
+        self._set_text(self.python_text, snippets["python"])
+        self._set_text(self.curl_text, snippets["curl"])
+
+    def _collect_settings(self) -> Dict[str, Any]:
+        return {
+            "port": self._port() or self.settings["port"],
+            "api_key": self.key_var.get().strip(),
+            "lan": bool(self.lan_var.get()),
+            "cors": bool(self.cors_var.get()),
+            "autostart": bool(self.autostart_var.get()),
+            "model": self.model_var.get().strip() or GUI_DEFAULTS["model"],
+            "think": bool(self.think_var.get()),
+            "search": bool(self.search_var.get()),
+        }
+
+    def _save_settings(self) -> None:
+        if self._save_job is not None:
+            self.root.after_cancel(self._save_job)
+            self._save_job = None
+        self.settings = self._collect_settings()
+        save_gui_settings(self.settings)
+
+    def _settings_changed(self) -> None:
+        if not hasattr(self, "python_text"):  # still building the window
+            return
+        app = self.server_app
+        if app is not None:  # API key and CORS apply to the running server right away
+            app.api_key = self.key_var.get().strip() or None
+            app.cors = bool(self.cors_var.get())
+        if not self.server:
+            self.url_var.set(self.base_url())
+        self._update_connect()
+        if self._save_job is not None:
+            self.root.after_cancel(self._save_job)
+        self._save_job = self.root.after(600, self._save_settings)
+
+    def _toggle_open_at_login(self) -> None:
+        wanted = bool(self.at_login_var.get())
+        try:
+            set_open_at_login(wanted)
+        except OSError as exc:
+            self.at_login_var.set(not wanted)
+            self.messagebox.showerror("Open at Windows sign-in", f"Could not change it: {exc}", parent=self.root)
+            return
+        if wanted:
+            log("The window will open (and start the server) when you sign in to Windows")
+        else:
+            log("The window will no longer open at Windows sign-in")
+
+    def generate_key(self) -> None:
+        self.key_var.set("sk-" + secrets.token_urlsafe(24))
+
+    def open_data_folder(self) -> None:
+        folder = app_dir()
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            if os.name == "nt":
+                os.startfile(str(folder))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(folder)])
+            else:
+                subprocess.Popen(["xdg-open", str(folder)])
+        except OSError as exc:
+            self.messagebox.showerror("Open data folder", f"{folder}\n\n{exc}", parent=self.root)
+
+    # ── account ─────────────────────────────────────────────────────────────
+
+    def _set_account(self, color: str, title: str, detail: str) -> None:
+        self._paint(self.account_dot, color)
+        self.account_var.set(title)
+        self.account_detail_var.set(detail)
+        self._update_login_buttons()
+
+    def _update_login_buttons(self) -> None:
+        busy = self.login_busy
+        for button in (self.btn_import, self.btn_window, self.btn_paste):
+            self._on(button, not busy)
+        signed_in = bool(extract_user_token(self.store.get().get("token")))
+        self._on(self.btn_signout, signed_in and not busy and not self.store.env_token)
+        if busy and self.login_cancel is not None:
+            self.btn_cancel.grid()
+        else:
+            self.btn_cancel.grid_remove()
+
+    def refresh_account(self, check: bool = False) -> None:
+        creds = self.store.get()
+        if not extract_user_token(creds.get("token")):
+            self._set_account(
+                "bad",
+                "Not signed in",
+                "Sign in at chat.deepseek.com in Chrome, Edge or Brave, then click “Use my browser's login”, "
+                "or click “Open sign-in window”.",
+            )
+            return
+        email = creds.get("email") or ""
+        detail = f"Login from {describe_login_source(creds)}"
+        if self.store.env_token:
+            detail = "Login from the DEEPSEEK_USER_TOKEN environment variable"
+        title = f"Signed in as {email}" if email else "Signed in"
+        if not check:
+            self._set_account("ok", title, detail)
+            return
+        self._set_account("muted", title, detail + "  ·  checking with DeepSeek…")
+
+        def work() -> None:
+            client = DeepSeekClient(self.store)
+            try:
+                access = client.access_token(force=True)
+                types = client.enabled_model_types(access)
+            except AuthError:
+                self.call(
+                    self._set_account,
+                    "bad",
+                    "The saved login no longer works",
+                    "DeepSeek rejected it (you signed out, or it expired). Sign in again.",
+                )
+                return
+            except UpstreamError as exc:
+                self.call(self._set_account, "warn", title, f"{detail}  ·  could not reach DeepSeek: {exc}")
+                return
+            who = client.account.get("email") or email
+            if who and who != email and not self.store.env_token:
+                self.store.update(email=who)
+            heading = f"Signed in as {who}" if who else "Signed in"
+            self.call(self._set_account, "ok", heading, f"{detail}  ·  model types: {', '.join(sorted(types))}")
+
+        threading.Thread(target=work, daemon=True, name="account-check").start()
+
+    def _run_login(self, title: str, work: Callable[[], bool], cancel: Optional[threading.Event] = None, detail: str = "") -> None:
+        """Run a login on a worker thread; work() returns True when a login was saved."""
+        self.login_busy, self.login_cancel = True, cancel
+        self._set_account("muted", title, detail)
+        said: List[str] = []
+
+        def runner() -> None:
+            me = threading.get_ident()
+
+            def collect(level: str, line: str) -> None:
+                if level == "SAY" and line.strip() and threading.get_ident() == me:
+                    said.append(line.strip())
+
+            _log_sinks.append(collect)
+            error: Optional[str] = None
+            try:
+                ok = bool(work())
+            except LoginError as exc:
+                ok, error = False, str(exc)
+            except Exception as exc:  # noqa: BLE001 - reported in the window
+                debug(traceback.format_exc())
+                ok, error = False, f"Unexpected error: {exc}"
+            finally:
+                _log_sinks.remove(collect)
+            self.call(self._login_done, ok, error, said)
+
+        threading.Thread(target=runner, daemon=True, name="login").start()
+
+    def _login_done(self, ok: bool, error: Optional[str], said: List[str]) -> None:
+        self.login_busy, self.login_cancel = False, None
+        for app in (self.chat_app, self.server_app):
+            if app is not None:
+                app.client.invalidate()
+        self.refresh_account(check=ok)
+        if not ok and error != "Cancelled." and not self.closed:
+            message = error or (said[-1] if said else "The login did not work; see the Log tab.")
+            self.messagebox.showwarning("DeepSeek login", message, parent=self.root)
+
+    def login_from_browser(self) -> None:
+        def work() -> bool:
+            creds = import_browser_login()
+            if not creds:
+                raise LoginError(
+                    "No working DeepSeek login was found in Chrome, Edge, Brave, Chromium, Vivaldi or Opera.\n\n"
+                    "Sign in at chat.deepseek.com in one of them, wait a few seconds and try again, "
+                    "or use “Open sign-in window”."
+                )
+            return _finish_login(self.store, creds) == 0
+
+        self._run_login("Looking for a DeepSeek login in your browsers…", work)
+
+    def login_in_window(self) -> None:
+        picked = pick_browser(None)
+        if not picked:
+            self.messagebox.showerror(
+                "DeepSeek login",
+                "No Chromium-based browser was found (Google Chrome, Microsoft Edge, Brave or Chromium).\n\n"
+                "Install one, or use “Paste a token…”.",
+                parent=self.root,
+            )
+            return
+        kind, exe = picked
+        cancel = threading.Event()
+
+        def work() -> bool:
+            say(f"Opening {kind}: {exe}")
+            creds = window_login(exe, browser_profile_dir(), timeout=900, cancel=cancel)
+            return _finish_login(self.store, creds) == 0
+
+        self._run_login(
+            f"Sign in to DeepSeek in the {_browser_name(exe)} window…",
+            work,
+            cancel,
+            "It is an ordinary browser window, so the captcha works as usual. It closes by itself a few "
+            "seconds after you are signed in; if it doesn't, close it yourself.",
+        )
+
+    def cancel_login(self) -> None:
+        if self.login_cancel is not None:
+            self.login_cancel.set()
+
+    def login_paste(self) -> None:
+        tk, ttk = self.tk, self.ttk
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Paste a DeepSeek token")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        body = ttk.Frame(dialog, padding=12)
+        body.pack(fill="both", expand=True)
+        ttk.Label(
+            body,
+            wraplength=round(480 * self.scale),
+            justify="left",
+            text=(
+                "In your browser, open chat.deepseek.com and press F12. Under Application › Local Storage › "
+                "https://chat.deepseek.com, copy the value of userToken and paste it below. A request copied "
+                "with “Copy as cURL” works too."
+            ),
+        ).pack(anchor="w")
+        text = tk.Text(body, width=66, height=7, wrap="char", relief="solid", borderwidth=1)
+        text.pack(fill="both", expand=True, pady=10)
+        text.focus_set()
+        row = ttk.Frame(body)
+        row.pack(fill="x")
+
+        def save() -> None:
+            content = text.get("1.0", "end").strip()
+            dialog.destroy()
+            if content:
+                self._run_login("Checking the token…", lambda: _manual_login(self.store, content) == 0)
+
+        ttk.Button(row, text="Cancel", command=dialog.destroy).pack(side="right")
+        ttk.Button(row, text="Save", command=save).pack(side="right", padx=6)
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        dialog.wait_visibility()
+        dialog.grab_set()
+        self.paste_dialog = (dialog, text, save)  # for the tests
+
+    def sign_out(self) -> None:
+        if not self.messagebox.askyesno(
+            "Sign out", "Remove the saved DeepSeek login from this app?\n\nYour browser stays signed in.", parent=self.root
+        ):
+            return
+        self.store.delete()
+        for app in (self.chat_app, self.server_app):
+            if app is not None:
+                app.client.invalidate()
+        log("Removed the saved DeepSeek login")
+        self.refresh_account()
+
+    # ── server ──────────────────────────────────────────────────────────────
+
+    def toggle_server(self) -> None:
+        if self.server:
+            self.stop_server()
+        else:
+            self.start_server()
+
+    def start_server(self) -> None:
+        if self.server or self.stopping:
+            return
+        port = self._port()
+        if port is None:
+            self.messagebox.showerror("API server", "The port must be a number from 1 to 65535.", parent=self.root)
+            return
+        lan = bool(self.lan_var.get())
+        api_key = self.key_var.get().strip()
+        if (
+            lan
+            and not api_key
+            and not self.messagebox.askyesno(
+                "No API key",
+                "Without an API key, anyone on your network can use your DeepSeek account through this server.\n\n"
+                "Start anyway?",
+                parent=self.root,
+            )
+        ):
+            return
+        host = "0.0.0.0" if lan else DEFAULT_HOST
+        app = App(self.store, api_key=api_key or None, cors=bool(self.cors_var.get()), check_host=not lan)
+        try:
+            server = ApiServer((host, port), ApiHandler, app)
+        except OSError as exc:
+            other = port + 1 if port < 65535 else port - 1
+            self.messagebox.showerror(
+                "API server",
+                f"Port {port} is not available ({exc}).\n\nAnother program, or another copy of this app, may be "
+                f"using it. Try port {other}.",
+                parent=self.root,
+            )
+            return
+        self.server, self.server_app = server, app
+        threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.5}, daemon=True, name="api-server").start()
+        log(f"API server running at {self.base_url()}" + (" (open to your network)" if lan else ""))
+        if not extract_user_token(self.store.get().get("token")):
+            log("Not signed in yet: requests will fail until you sign in.", "WARN")
+        self._save_settings()
+        self._server_state()
+
+    def stop_server(self, then: Optional[Callable[[], None]] = None) -> None:
+        server, app = self.server, self.server_app
+        if server is None or app is None:
+            if then:
+                then()
+            return
+        self.server = self.server_app = None
+        self.stopping = True
+        self._server_state()
+
+        def work() -> None:
+            server.shutdown()
+            server.server_close()
+            app.client.wait_for_cleanup()
+            self.call(self._server_stopped, then)
+
+        threading.Thread(target=work, daemon=True, name="api-server-stop").start()
+
+    def _server_stopped(self, then: Optional[Callable[[], None]]) -> None:
+        self.stopping = False
+        log("API server stopped")
+        self._server_state()
+        if then:
+            then()
+
+    def _server_state(self) -> None:
+        running = self.server is not None
+        if self.stopping:
+            self.server_btn.configure(text="Stopping…")
+            self._on(self.server_btn, False)
+            self._paint(self.server_dot, "muted")
+            self.server_var.set("Stopping…")
+        elif running:
+            self.server_btn.configure(text="Stop server")
+            self._on(self.server_btn, True)
+            self._paint(self.server_dot, "ok")
+            state = "Running"
+            if self.server_app is not None and not self.server_app.check_host:
+                address = lan_address()
+                port = self.server.server_address[1]  # type: ignore[union-attr]
+                state += f" · other devices: http://{address}:{port}/v1" if address else " · open to your network"
+            self.server_var.set(state)
+        else:
+            self.server_btn.configure(text="Start server")
+            self._on(self.server_btn, True)
+            self._paint(self.server_dot, "muted")
+            self.server_var.set("Stopped")
+        self._on(self.port_entry, not running and not self.stopping)
+        self._on(self.lan_check, not running and not self.stopping)
+        self.url_var.set(self.base_url())
+        self._update_connect()
+
+    def _tick(self) -> None:
+        if self.closed:
+            return
+        app = self.server_app
+        if app is None:
+            text = "The API server is stopped." if not self.stopping else ""
+        else:
+            stats = dict(app.stats)
+            text = f"Requests: {stats['requests']}  ·  failed: {stats['errors']}"
+            last = stats.get("last")
+            if last:
+                at = time.strftime("%H:%M:%S", time.localtime(last["at"]))
+                text += f"  ·  last: {last['model']} → {last['status']} in {last['seconds']}s at {at}"
+        self.stats_var.set(text)
+        self._jobs["tick"] = self.root.after(1000, self._tick)
+
+    # ── try it ──────────────────────────────────────────────────────────────
+
+    def _chat_write(self, text: str, tag: Optional[str] = None) -> None:
+        widget = self.chat_out
+        widget.configure(state="normal")
+        widget.insert("end", text, tag or ())
+        widget.see("end")
+        widget.configure(state="disabled")
+
+    def send_chat(self) -> None:
+        if self.chat_stop is not None:
+            return
+        text = self.prompt.get("1.0", "end").strip()
+        if not text:
+            return
+        self.prompt.delete("1.0", "end")
+        model = self.model_var.get().strip() or GUI_DEFAULTS["model"]
+        self.history.append({"role": "user", "content": text})
+        self._chat_write("You\n", "who")
+        self._chat_write(text + "\n\n")
+        self._chat_write(f"DeepSeek · {model}\n", "who")
+        body: Dict[str, Any] = {"model": model, "messages": list(self.history), "stream": True}
+        if self.think_var.get():
+            body["thinking_enabled"] = True
+        if self.search_var.get():
+            body["search_enabled"] = True
+        stop = threading.Event()
+        self.chat_stop = stop
+        self._on(self.send_btn, False)
+        self._on(self.stop_btn, True)
+        self._save_settings()
+
+        def work() -> None:
+            answer: List[str] = []
+            thinking = False
+            error: Optional[str] = None
+            events: Optional[Iterator[Tuple[str, Any]]] = None
+            try:
+                events = ChatJob(self.chat_app, body).run()
+                for kind, value in events:
+                    if stop.is_set():
+                        break
+                    if kind == "reasoning":
+                        if not thinking:
+                            thinking = True
+                            self.call(self._chat_write, "Thinking…\n", "meta")
+                        self.call(self._chat_write, value, "reasoning")
+                    elif kind == "content":
+                        if thinking:
+                            thinking = False
+                            self.call(self._chat_write, "\n\n")
+                        answer.append(value)
+                        self.call(self._chat_write, value)
+                    elif kind == "end" and value.get("error"):
+                        error = value["error"]
+            except (UpstreamError, BadRequest) as exc:
+                error = str(exc)
+            except Exception as exc:  # noqa: BLE001 - shown in the chat
+                debug(traceback.format_exc())
+                error = f"Unexpected error: {exc}"
+            finally:
+                if events is not None:
+                    events.close()  # schedules the deletion of the temporary chat
+            self.call(self._chat_done, "".join(answer), error, stop.is_set())
+
+        threading.Thread(target=work, daemon=True, name="try-it").start()
+
+    def _chat_done(self, answer: str, error: Optional[str], stopped: bool) -> None:
+        self.chat_stop = None
+        if error:
+            self._chat_write(("\n" if answer else "") + error, "error")
+        if stopped:
+            self._chat_write(" [stopped]", "meta")
+        if answer:
+            self.history.append({"role": "assistant", "content": answer})
+        elif self.history and self.history[-1]["role"] == "user":
+            self.history.pop()  # nothing came back: don't replay this turn
+        self._chat_write("\n\n")
+        self._on(self.send_btn, True)
+        self._on(self.stop_btn, False)
+        if error and ("login" in error.lower() or "token" in error.lower()):
+            self.refresh_account(check=True)
+
+    def stop_chat(self) -> None:
+        if self.chat_stop is not None:
+            self.chat_stop.set()
+
+    def new_chat(self) -> None:
+        self.stop_chat()
+        self.history = []
+        self.chat_out.configure(state="normal")
+        self.chat_out.delete("1.0", "end")
+        self.chat_out.configure(state="disabled")
+
+    # ── closing ─────────────────────────────────────────────────────────────
+
+    def close(self) -> None:
+        if self.server and not self.messagebox.askokcancel(
+            "Quit", "The API server is running. Stop it and quit?", parent=self.root
+        ):
+            return
+        self._save_settings()
+        self.cancel_login()
+        self.stop_chat()
+        self.root.withdraw()
+        self.stop_server(then=self._destroy)
+
+    def _destroy(self) -> None:
+        self.closed = True
+        if self._sink in _log_sinks:
+            _log_sinks.remove(self._sink)
+        for job in list(self._jobs.values()) + ([self._save_job] if self._save_job else []):
+            try:
+                self.root.after_cancel(job)
+            except self.tk.TclError:
+                pass
+        self.chat_app.client.wait_for_cleanup(2.0)
+        self.root.destroy()
+
+
+def _show_fatal(message: str) -> None:
+    say(message)
+    if os.name == "nt" and sys.stdout is None:  # started with pythonw: there is no console to read it in
+        try:
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(None, message, "DeepSeek Web API", 0x10)  # type: ignore[attr-defined]
+        except (AttributeError, OSError, ImportError):
+            pass
+
+
+def run_gui(minimized: bool = False, start_server: bool = False) -> int:
+    try:
+        import tkinter as tk
+    except ImportError:
+        _show_fatal(
+            "The window needs Tkinter. On Windows it comes with the python.org installer (keep the "
+            '"tcl/tk and IDLE" option ticked); on Linux install python3-tk. The command line works '
+            "without it: py deepseek_web_api.py serve"
+        )
+        return 1
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)  # type: ignore[attr-defined]  # sharp text on HiDPI
+            # Group the taskbar button under this app (and its icon) rather than python.exe.
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("DeepSeekWebAPI.Window")  # type: ignore[attr-defined]
+        except (AttributeError, OSError, ImportError):
+            pass
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        _show_fatal(f"Could not open a window: {exc}")
+        return 1
+    DesktopApp(root, start_server=start_server)
+    if minimized:
+        root.iconify()
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+def cmd_gui(args: argparse.Namespace) -> int:
+    return run_gui(minimized=args.minimized, start_server=args.start_server)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -4542,13 +5666,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     store = CredentialStore(credentials_path(), env_token=os.environ.get("DEEPSEEK_USER_TOKEN"))
     creds = store.get()
     token = extract_user_token(creds.get("token"))
-    source = creds.get("source") if isinstance(creds.get("source"), dict) else {}
-    if source.get("type") == "browser":
-        origin = f"{source.get('browser')} (profile \"{Path(str(source.get('profile'))).name}\")"
-    elif source.get("type") == "window":
-        origin = "the login browser window"
-    else:
-        origin = "pasted token" if token else "-"
+    origin = describe_login_source(creds)
     say(f"Data folder     : {app_dir()}")
     say(f"Credentials     : {store.path} ({'found' if store.path.exists() else 'not found'})")
     say(f"Token           : {mask_secret(token)}{' (from DEEPSEEK_USER_TOKEN)' if store.env_token else ''}")
@@ -4690,6 +5808,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "examples:\n"
+            "  py deepseek_web_api.py gui            open the desktop window\n"
             "  py deepseek_web_api.py login          reuse your browser's DeepSeek login or sign in\n"
             "  py deepseek_web_api.py                start the API on http://127.0.0.1:20129/v1\n"
             "  py deepseek_web_api.py serve --port 8080 --api-key secret\n"
@@ -4726,6 +5845,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("status", parents=[common], help="show the login state and check the token")
 
+    gui = sub.add_parser("gui", parents=[common], help="open the desktop window: sign in, run the server, try it")
+    gui.add_argument("--minimized", action="store_true", help="start minimized")
+    gui.add_argument("--start-server", action="store_true", help="start the API server right away")
+
     chat = sub.add_parser("chat", parents=[common], help="send one prompt from the terminal")
     chat.add_argument("prompt", nargs="+", help="the message to send")
     chat.add_argument("--model", default="deepseek-v4-flash", help="model name (default deepseek-v4-flash)")
@@ -4761,13 +5884,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     global _verbose
     _setup_console()
     argv = list(sys.argv[1:] if argv is None else argv)
-    commands = {"serve", "login", "logout", "status", "chat"}
+    commands = {"serve", "login", "logout", "status", "chat", "gui"}
     if not any(arg in commands for arg in argv) and not {"-h", "--help", "--version"} & set(argv):
         argv.insert(0, "serve")  # double-click / no arguments -> run the server
     args = build_parser().parse_args(argv)
     _verbose = bool(getattr(args, "verbose", False))
     configure_proxy(getattr(args, "proxy", None))
-    handlers = {"serve": cmd_serve, "login": cmd_login, "logout": cmd_logout, "status": cmd_status, "chat": cmd_chat}
+    handlers = {
+        "serve": cmd_serve,
+        "login": cmd_login,
+        "logout": cmd_logout,
+        "status": cmd_status,
+        "chat": cmd_chat,
+        "gui": cmd_gui,
+    }
     try:
         code = handlers[args.command](args)
     except KeyboardInterrupt:
